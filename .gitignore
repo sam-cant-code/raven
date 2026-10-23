@@ -1,0 +1,6 @@
+.env
+coc.db
+coc.db-wal
+coc.db-shm
+test.png
+__pycache__/

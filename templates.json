@@ -1,0 +1,22 @@
+{
+  "example": {
+    "name": "Example",
+    "rank": "#1",
+    "off_total": 100,
+    "def_total": 50,
+    "off_avg": 2.5,
+    "def_avg": 1.5,
+    "off_dest": 85.0,
+    "def_dest": 60.0
+  },
+  "15": {
+    "name": "abcdefrtyuiwqer",
+    "rank": "#1",
+    "off_total": 1000,
+    "def_total": 541,
+    "off_avg": 2.5,
+    "def_avg": 1.5,
+    "off_dest": 85.0,
+    "def_dest": 60.0
+  }
+}
