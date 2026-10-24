@@ -687,7 +687,7 @@ def render(name: str, rank: str, off_total: int, def_total: int,
 
 # ---- discord.py part ----
 log = logging.getLogger("cocbot")
-POLL_INTERVAL = 300   # seconds between battlelog polls (5 minutes)
+POLL_INTERVAL = 900   # seconds between battlelog polls (15 minutes)
 
 
 class CocClient(discord.Client):
@@ -722,7 +722,7 @@ def safe_name(name):
 
 # ---- background poller: saves every new ranked battle of tracked players AND of everyone
 # in their league group, so the offense/defense leaderboards are complete ----
-NAME_REFRESH_EVERY = 12   # every 12th poll (about hourly): names, league groups and pruning are refreshed
+NAME_REFRESH_EVERY = 4    # every 4th poll (about hourly at 15 min): names, league groups and pruning are refreshed
 POLL_CONCURRENCY = 8      # simultaneous battlelog requests (coc_api.COC_RATE sets the real speed)
 
 
@@ -765,6 +765,8 @@ async def sync_groups(rows):
 
 
 async def poll_once(refresh=False):
+    loop = asyncio.get_running_loop()
+    t0 = loop.time()
     rows = await asyncio.to_thread(coc_db.list_tracked)
     if refresh:
         await sync_groups(rows)
@@ -787,10 +789,24 @@ async def poll_once(refresh=False):
             return
         new_total += n
 
-    await asyncio.gather(*(one(t) for t in tags))
+    # worker pool: only POLL_CONCURRENCY tasks exist at a time, instead of one task per player
+    queue = asyncio.Queue()
+    for t in tags:
+        queue.put_nowait(t)
+
+    async def worker():
+        while True:
+            try:
+                tag = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            await one(tag)
+
+    await asyncio.gather(*(worker() for _ in range(POLL_CONCURRENCY)))
     if refresh:
         await asyncio.to_thread(coc_db.prune)
-    log.info("polled %d players, %d new ranked battles", len(tags), new_total)
+    log.info("polled %d players, %d new ranked battles in %.0fs",
+             len(tags), new_total, loop.time() - t0)
 
 
 async def poll_loop():
@@ -877,26 +893,25 @@ def cnt(n):
 def render_table(mode, rows, start, size, my_tag, zone_of):
     """One page as an aligned text table for a ```ansi code block.
     Your own row is gold and marked with '>'; in the trophy view promotion rows are green
-    and demotion rows red. The number in brackets after a total is how many battles it covers
-    (attacks done, or defenses taken)."""
+    and demotion rows red. In the offense/defense views the number in brackets after a total
+    is how many battles it covers (attacks done, or defenses taken)."""
     if mode == "trophies":
-        cols = [("Troph", 8), ("Def", 4), ("Off", 4)]
+        cols = [("Trophies", 8)]
     else:
         cols = [("Total", 9), ("Avg", 5)]
-    out = [ANSI_HEAD + f"{'#':>3}  {fit_cell('Player', NAME_W)}"
+    out = [ANSI_HEAD + f"{'#':>3} {fit_cell('Player', NAME_W)}"
            + "".join(f" {h:>{w}}" for h, w in cols) + ANSI_RESET]
     for pos, r in enumerate(rows[start:start + size], start + 1):
         if mode == "trophies":
-            vals = [str(r["trophies"]) + (cnt(r["n_att"]) if "n_att" in r else ""),
-                    avg_stars(r, "def_avg", "n_def"), avg_stars(r, "off_avg", "n_att")]
+            vals = [str(r["trophies"]) + (cnt(r["n_att"]) if "n_att" in r else "")]
         elif mode == "off":
             vals = [f"{r.get('off_total', 0):+d}" + (cnt(r["n_att"]) if "n_att" in r else ""),
-                    per_battle(r, "off_total", "n_att")]
+                    avg_stars(r, "off_avg", "n_att")]
         else:
             vals = [f"{r.get('def_total', 0):+d}" + (cnt(r["n_def"]) if "n_def" in r else ""),
-                    per_battle(r, "def_total", "n_def")]
+                    avg_stars(r, "def_avg", "n_def")]
         mine = r["tag"] == my_tag
-        line = (f"{pos:>3} {'>' if mine else ' '}{fit_cell(r['name'], NAME_W)}"
+        line = (f"{pos:>3}{'>' if mine else ' '}{fit_cell(r['name'], NAME_W)}"
                 + "".join(f" {v:>{w}}" for v, (_, w) in zip(vals, cols)))
         color = ANSI_ME if mine else (ANSI_ZONE.get(zone_of(pos)) if mode == "trophies" else None)
         out.append(f"{color}{line}{ANSI_RESET}" if color else line)
@@ -1002,8 +1017,8 @@ class TableView(discord.ui.View):
         e = discord.Embed(title=f"{self.league} · {MODE_LABELS[self.mode]}",
                           description=desc, colour=discord.Colour.gold())
         legend = {"trophies": "gold = you · green/red = promotion/demotion · (n) = attacks done",
-                  "off": "gold = you · (n) = attacks · Avg = trophies per attack",
-                  "def": "gold = you · (n) = defenses taken · Avg = trophies per defense"}[self.mode]
+                  "off": "gold = you · (n) = attacks · Avg = average stars per attack",
+                  "def": "gold = you · (n) = defenses taken · Avg = average stars per defense"}[self.mode]
         if self.failed:
             legend += f" · {self.failed} players couldn't be loaded"
         e.set_footer(text=f"Page {self.page + 1}/{self.pages} · {legend}")
@@ -1347,15 +1362,36 @@ async def untrack_player(inter: discord.Interaction, player: PlayerT):
 untrack_player.autocomplete("player")(tracked_autocomplete)
 
 
-@tree.command(name="tracked_players", description="List the registered players")
+def _tracked_text(rows, watched, fmt, bold):
+    lines = [f"{bold}Registered players ({len(rows)}){bold}"]
+    lines += [f"- {fmt(r['name'])} (#{r['tag']})" for r in rows]
+    if watched:
+        groups = {}
+        for w in watched:
+            groups.setdefault(w["group_key"], []).append(w)
+        lines += ["", f"{bold}Also tracked: league group members ({len(watched)}){bold}"]
+        for i, members in enumerate(groups.values(), 1):
+            lines.append(f"League group {i} ({len(members)} players)")
+            lines += [f"- {fmt(w['name'])} (#{w['tag']})" for w in members]
+    return "\n".join(lines)
+
+
+@tree.command(name="tracked_players", description="List registered players and everyone else being tracked")
 async def tracked_players(inter: discord.Interaction):
     rows = await asyncio.to_thread(coc_db.list_tracked)
-    if not rows:
-        await inter.response.send_message("Nobody is registered yet. Use `/track_player`.", ephemeral=True)
+    watched = await asyncio.to_thread(coc_db.list_watched)
+    if not rows and not watched:
+        await inter.response.send_message("Nobody is tracked yet. Use `/track_player`.", ephemeral=True)
         return
-    lines = [f"- {safe_name(r['name'])} (#{r['tag']})" for r in rows[:40]]
-    more = f"\n...and {len(rows) - 40} more" if len(rows) > 40 else ""
-    await inter.response.send_message(f"**Registered players ({len(rows)})**\n" + "\n".join(lines) + more)
+    text = _tracked_text(rows, watched, safe_name, "**")
+    if len(text) <= 1900:
+        await inter.response.send_message(text)
+        return
+    # too long for one Discord message -> send the full list as a text file
+    plain = _tracked_text(rows, watched, lambda n: n or "Unknown", "")
+    await inter.response.send_message(
+        f"{len(rows)} registered + {len(watched)} league group members are tracked. Full list attached.",
+        file=discord.File(io.BytesIO(plain.encode("utf-8")), filename="tracked_players.txt"))
 
 
 @tree.error

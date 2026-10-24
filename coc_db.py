@@ -11,10 +11,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 DB_PATH = Path(__file__).parent / "coc.db"
-KEEP_DAYS = 21       # battles older than this are deleted
-MAX_TRACKED = 150    # max registered players
-MAX_PER_USER = 5     # players one Discord user can register
-MAX_WATCHED = 1500   # max players polled only because they share a league group (about 15 groups)
+KEEP_DAYS = 21        # battles older than this are deleted
+MAX_TRACKED = 100     # max registered players
+MAX_PER_USER = 5      # players one Discord user can register
+MAX_WATCHED = 10000   # max players polled only because they share a league group (100 per group)
 _FMT = "%Y-%m-%dT%H:%M:%S"
 
 
@@ -128,6 +128,16 @@ def drop_group_if_unused(tag):
                          "WHERE w.group_key=? AND w.tag != ?", (row["group_key"], tag)).fetchone()[0]
         if left == 0:
             c.execute("DELETE FROM watched WHERE group_key=?", (row["group_key"],))
+
+
+def list_watched():
+    """Players polled only because they share a league group with a tracked player
+    (registered players are left out, they're listed separately). Ordered by group, then name."""
+    with _db() as c:
+        return [dict(r) for r in c.execute(
+            "SELECT tag, name, group_key FROM watched "
+            "WHERE tag NOT IN (SELECT tag FROM tracked) "
+            "ORDER BY group_key, name COLLATE NOCASE")]
 
 
 def watch_status(tags):

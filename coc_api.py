@@ -18,9 +18,16 @@ COC_API_TOKEN = (COC_API_TOKEN or os.environ.get("COC_API_TOKEN", "")).strip()
 
 
 def _collect_tokens():
-    """COC_API_TOKEN plus any number of extra keys in COC_API_TOKENS (comma or space separated)."""
+    """Every API key found in the environment, no duplicates. Accepted names:
+        COC_API_TOKEN            (the original single key)
+        COC_API_TOKEN_1, COC_API_TOKEN_2, COC_API_TOKEN_3 ...   (one key per variable)
+        COC_API_TOKENS           (old style: several keys in one variable, comma/space separated)"""
+    numbered = sorted(
+        ((int(m.group(1)), v) for k, v in os.environ.items()
+         if (m := re.fullmatch(r"COC_API_TOKEN_?(\d+)", k.strip().upper()))),
+        key=lambda x: x[0])
     out = []
-    for t in [COC_API_TOKEN, *re.split(r"[,\s;]+", os.environ.get("COC_API_TOKENS", ""))]:
+    for t in [COC_API_TOKEN, *(v for _, v in numbered), *re.split(r"[,\s;]+", os.environ.get("COC_API_TOKENS", ""))]:
         t = t.strip()
         if t and t not in out:
             out.append(t)
