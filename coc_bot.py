@@ -757,10 +757,106 @@ async def poll_loop():
         await asyncio.sleep(POLL_INTERVAL)
 
 
-async def send_image(inter, vals):
+async def send_image(inter, vals, view=None):
+    """Renders the image and sends it. Returns the sent message (needed for the view timeout)."""
     async with sem:
         data = await asyncio.get_running_loop().run_in_executor(None, lambda: render(**vals))
-    await inter.followup.send(file=discord.File(io.BytesIO(data), "out.png"))
+    kwargs = {"view": view} if view else {}
+    return await inter.followup.send(file=discord.File(io.BytesIO(data), "out.png"), **kwargs)
+
+
+# ---- league table: button on /battle_log -> paginated list of the 100 players ----
+TABLE_PAGE_SIZE = 10   # 10 players per page -> 10 pages for 100 players
+
+
+class TableView(discord.ui.View):
+    """Paginated league table. Sent as an ephemeral message, so only the clicker sees it."""
+
+    def __init__(self, league, members, my_tag):
+        super().__init__(timeout=300)
+        self.league = league
+        self.members = members
+        self.my_tag = my_tag
+        self.pages = max(1, math.ceil(len(members) / TABLE_PAGE_SIZE))
+        self.my_index = next((i for i, m in enumerate(members)
+                              if coc_api.normalize_tag(m.get("playerTag")) == my_tag), None)
+        self.page = (self.my_index // TABLE_PAGE_SIZE) if self.my_index is not None else 0
+        self.inter = None
+        self.me_btn.disabled = self.my_index is None
+        self._sync()
+
+    def _sync(self):
+        self.prev_btn.disabled = self.page <= 0
+        self.next_btn.disabled = self.page >= self.pages - 1
+        self.page_btn.label = f"{self.page + 1}/{self.pages}"
+
+    def embed(self):
+        start = self.page * TABLE_PAGE_SIZE
+        lines = []
+        for i, m in enumerate(self.members[start:start + TABLE_PAGE_SIZE], start + 1):
+            mtag = coc_api.normalize_tag(m.get("playerTag"))
+            zone = {"promotion": "🟢", "demotion": "🔴"}.get(movement_from_rank(self.league, i), "⚪")
+            pointer = "➤ " if mtag == self.my_tag else ""
+            name = safe_name(m.get("playerName"))
+            clan = safe_name(m.get("clanName")) if m.get("clanName") else "No clan"
+            lines.append(f"{zone} `#{i:<3}` {pointer}**{name}** · {m.get('leagueTrophies', 0)} 🏆\n"
+                         f"╰ {clan}")
+        e = discord.Embed(title=f"{self.league} · League Table",
+                          description="\n".join(lines), colour=discord.Colour.gold())
+        e.set_footer(text=f"Page {self.page + 1}/{self.pages} · 🟢 promotion  🔴 demotion")
+        return e
+
+    async def _go(self, inter, page):
+        self.page = max(0, min(page, self.pages - 1))
+        self._sync()
+        await inter.response.edit_message(embed=self.embed(), view=self)
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary)
+    async def prev_btn(self, inter: discord.Interaction, button: discord.ui.Button):
+        await self._go(inter, self.page - 1)
+
+    @discord.ui.button(label="1/1", style=discord.ButtonStyle.secondary, disabled=True)
+    async def page_btn(self, inter: discord.Interaction, button: discord.ui.Button):
+        pass
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary)
+    async def next_btn(self, inter: discord.Interaction, button: discord.ui.Button):
+        await self._go(inter, self.page + 1)
+
+    @discord.ui.button(label="Me", style=discord.ButtonStyle.primary)
+    async def me_btn(self, inter: discord.Interaction, button: discord.ui.Button):
+        await self._go(inter, self.my_index // TABLE_PAGE_SIZE)
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+        if self.inter:
+            try:
+                await self.inter.edit_original_response(view=self)
+            except discord.HTTPException:
+                pass
+
+
+class BattleLogView(discord.ui.View):
+    """Attached to the /battle_log image. Opens the league table."""
+
+    def __init__(self, league, members, my_tag):
+        super().__init__(timeout=600)
+        self.league, self.members, self.my_tag = league, members, my_tag
+        self.message = None
+
+    @discord.ui.button(label="League Table", emoji="📊", style=discord.ButtonStyle.primary)
+    async def open_table(self, inter: discord.Interaction, button: discord.ui.Button):
+        view = TableView(self.league, self.members, self.my_tag)
+        await inter.response.send_message(embed=view.embed(), view=view, ephemeral=True)
+        view.inter = inter
+
+    async def on_timeout(self):
+        if self.message:
+            try:
+                await self.message.edit(view=None)   # drop the button once the data is stale
+            except discord.HTTPException:
+                pass
 
 
 async def tracked_autocomplete(inter: discord.Interaction, current: str):
@@ -916,7 +1012,13 @@ async def battle_log(inter: discord.Interaction, player: Optional[PlayerT] = Non
     if err:
         await inter.followup.send(err)
         return
-    await send_image(inter, vals)
+
+    view = None
+    if data["members"]:   # Legend I (and API failures) have no group -> no button
+        view = BattleLogView(data["league"], data["members"], clean)
+    msg = await send_image(inter, vals, view)
+    if view:
+        view.message = msg
 
 
 battle_log.autocomplete("player")(tracked_autocomplete)

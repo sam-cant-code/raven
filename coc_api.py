@@ -1,7 +1,7 @@
 """Clash of Clans API helpers.
 
 player tag -> /players (name, league, group tag, season id)
-           -> /leaguegroup (rank = position in the members list)
+           -> /leaguegroup (rank = position in the members list, plus the full table)
            -> /battlelog (ranked battles inside the current window)
 """
 import asyncio
@@ -162,7 +162,8 @@ async def get_battlelog(tag):
 
 async def fetch_summary(tag, stored=None):
     """tag = normalized tag (no #); stored = battles from coc_db.load_battles (optional).
-    Returns name, league, rank, attacks, defenses, window and the live ranked battles."""
+    Returns name, league, rank, attacks, defenses, window, the live ranked battles,
+    and the full league group members list (for the league table)."""
     player = await get_player(tag)
     name = player.get("name") or "Unknown"
     league = (player.get("leagueTier") or {}).get("name")
@@ -179,17 +180,19 @@ async def fetch_summary(tag, stored=None):
     else:
         raise CocError(f"{name} has no active tournament season.")
 
-    async def group_rank():
+    async def group_members():
         if is_legend1(league) or not group_tag or not season_id:
-            return None
+            return []
         try:
             g = await _get(f"/leaguegroup/%23{group_tag}/{season_id}?playerTag=%23{tag}")
         except CocError:
-            return None   # rank is optional: the image still renders without it
-        return find_rank(g.get("members"), tag)
+            return []   # optional: the image still renders without it
+        return g.get("members") or []
 
-    rank, items = await asyncio.gather(group_rank(), get_battlelog(tag))
+    members, items = await asyncio.gather(group_members(), get_battlelog(tag))
+    rank = find_rank(members, tag)
     live = extract_ranked(items)
     attacks, defenses = split_window(merge_battles(stored, live), start, end)
     return {"name": name, "league": league, "rank": rank, "attacks": attacks,
-            "defenses": defenses, "window": (start, end), "live": live}
+            "defenses": defenses, "window": (start, end), "live": live,
+            "members": members, "tag": tag}
