@@ -1,0 +1,68 @@
+diff --git a/coc_bot.py b/coc_bot.py
+index a962fc9..5100fdc 100644
+--- a/coc_bot.py
++++ b/coc_bot.py
+@@ -1347,15 +1347,36 @@ async def untrack_player(inter: discord.Interaction, player: PlayerT):
+ untrack_player.autocomplete("player")(tracked_autocomplete)
+ 
+ 
+-@tree.command(name="tracked_players", description="List the registered players")
++def _tracked_text(rows, watched, fmt, bold):
++    lines = [f"{bold}Registered players ({len(rows)}){bold}"]
++    lines += [f"- {fmt(r['name'])} (#{r['tag']})" for r in rows]
++    if watched:
++        groups = {}
++        for w in watched:
++            groups.setdefault(w["group_key"], []).append(w)
++        lines += ["", f"{bold}Also tracked: league group members ({len(watched)}){bold}"]
++        for i, members in enumerate(groups.values(), 1):
++            lines.append(f"League group {i} ({len(members)} players)")
++            lines += [f"- {fmt(w['name'])} (#{w['tag']})" for w in members]
++    return "\n".join(lines)
++
++
++@tree.command(name="tracked_players", description="List registered players and everyone else being tracked")
+ async def tracked_players(inter: discord.Interaction):
+     rows = await asyncio.to_thread(coc_db.list_tracked)
+-    if not rows:
+-        await inter.response.send_message("Nobody is registered yet. Use `/track_player`.", ephemeral=True)
++    watched = await asyncio.to_thread(coc_db.list_watched)
++    if not rows and not watched:
++        await inter.response.send_message("Nobody is tracked yet. Use `/track_player`.", ephemeral=True)
+         return
+-    lines = [f"- {safe_name(r['name'])} (#{r['tag']})" for r in rows[:40]]
+-    more = f"\n...and {len(rows) - 40} more" if len(rows) > 40 else ""
+-    await inter.response.send_message(f"**Registered players ({len(rows)})**\n" + "\n".join(lines) + more)
++    text = _tracked_text(rows, watched, safe_name, "**")
++    if len(text) <= 1900:
++        await inter.response.send_message(text)
++        return
++    # too long for one Discord message -> send the full list as a text file
++    plain = _tracked_text(rows, watched, lambda n: n or "Unknown", "")
++    await inter.response.send_message(
++        f"{len(rows)} registered + {len(watched)} league group members are tracked. Full list attached.",
++        file=discord.File(io.BytesIO(plain.encode("utf-8")), filename="tracked_players.txt"))
+ 
+ 
+ @tree.error
+diff --git a/coc_db.py b/coc_db.py
+index 080977a..775837d 100644
+--- a/coc_db.py
++++ b/coc_db.py
+@@ -130,6 +130,16 @@ def drop_group_if_unused(tag):
+             c.execute("DELETE FROM watched WHERE group_key=?", (row["group_key"],))
+ 
+ 
++def list_watched():
++    """Players polled only because they share a league group with a tracked player
++    (registered players are left out, they're listed separately). Ordered by group, then name."""
++    with _db() as c:
++        return [dict(r) for r in c.execute(
++            "SELECT tag, name, group_key FROM watched "
++            "WHERE tag NOT IN (SELECT tag FROM tracked) "
++            "ORDER BY group_key, name COLLATE NOCASE")]
++
++
+ def watch_status(tags):
+     """tag -> {group_key, since (datetime), primed (bool)} for the tags that are watched."""
+     tags = list(tags)

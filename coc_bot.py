@@ -1,5 +1,5 @@
 import io, math, asyncio, re, random, os, logging, unicodedata
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal, Optional
 
@@ -52,6 +52,10 @@ NAME_MAX_CHARS = 15
 
 # ---- RANK (unchanged, still centered) ----
 RANK_POS, RANK_MAX_W, RANK_SIZE = (150, 70), 300, 40
+
+# ---- LEGEND I layout: no banner, rank on the left and the name starts after it ----
+RANK_L1_X = 45        # left edge of the rank text
+NAME_GAP_L1 = 35      # space between the rank and the name
 
 # ---- TOTAL / OFF / DEF (trophy numbers, NOT affected by SHIFT) ----
 TOTAL = {"pos": (858, 70),   "anchor": "lm", "size": 48, "max_w": 95,  "fill": "#ffd84a", "outline": 4}
@@ -143,7 +147,7 @@ LEAGUES = (
     + _grp("Electro", (31, 32, 33), 18, [20, 20, 15], 15)
     + [("Legend III", 24, 5, 15),
        ("Legend II", 30, 3, 15),
-       ("Legend I", 30, None, None)]   # <-- Legend I: CHANGE these numbers
+       ("Legend I", 8, None, None)]    # Legend I: 8 attacks/defenses, resets daily at 05:00 GMT
 )
 LEAGUE_NAMES = [l[0] for l in LEAGUES]
 
@@ -345,11 +349,12 @@ def attack_trophies(stars, pct):
     return min(4, int(pct // 10))   # 0 stars: +1 per full 10%
 
 
-def defense_trophies(stars, pct):
-    """Defender gets 40 minus what the attacker earned (0 stars = full 40)."""
-    if stars == 0:
-        return 40
-    return 40 - attack_trophies(stars, pct)
+def defense_trophies(stars, pct, legend1=False):
+    """Defender gets 40 minus what the attacker earned (0 stars = full 40).
+    Legend I: defenses are always negative, -(40 - x) where x is the value above,
+    i.e. the defender loses exactly what the attacker earned."""
+    x = 40 if stars == 0 else 40 - attack_trophies(stars, pct)
+    return -(40 - x) if legend1 else x
 
 
 def random_battles(kind, count=None, limit=MAX_BATTLES):
@@ -366,7 +371,7 @@ def random_battles(kind, count=None, limit=MAX_BATTLES):
     return out
 
 
-def derive_stats(attacks, defenses):
+def derive_stats(attacks, defenses, legend1=False):
     """Everything is calculated from the battle lists: trophy totals, average stars,
     average destruction %. Empty list -> zeros."""
     vals = {"off_total": 0, "off_avg": 0.0, "off_dest": 0.0,
@@ -376,7 +381,7 @@ def derive_stats(attacks, defenses):
         vals["off_avg"] = sum(s for s, _ in attacks) / len(attacks)
         vals["off_dest"] = sum(p for _, p in attacks) / len(attacks)
     if defenses:
-        vals["def_total"] = sum(defense_trophies(s, p) for s, p in defenses)
+        vals["def_total"] = sum(defense_trophies(s, p, legend1) for s, p in defenses)
         vals["def_avg"] = sum(s for s, _ in defenses) / len(defenses)
         vals["def_dest"] = sum(p for _, p in defenses) / len(defenses)
     return vals
@@ -387,8 +392,9 @@ def resolve(name, rank, attacks_txt, defenses_txt, randomize=False, league=None)
     league = (league or DEFAULT_LEAGUE)[:LEAGUE_MAX_CHARS]
     limit = league_attacks(league)
     n = rank_number(rank)
-    if n is not None and not 1 <= n <= PLAYERS_PER_LEAGUE:
-        return None, f"Rank must be between 1 and {PLAYERS_PER_LEAGUE}."
+    max_rank = 999999 if coc_api.is_legend1(league) else PLAYERS_PER_LEAGUE   # Legend I has no 100-player group
+    if n is not None and not 1 <= n <= max_rank:
+        return None, f"Rank must be between 1 and {max_rank}."
     movement = movement_from_rank(league, rank)
 
     attacks, e1 = parse_battles(attacks_txt or "", limit)
@@ -400,7 +406,7 @@ def resolve(name, rank, attacks_txt, defenses_txt, randomize=False, league=None)
     if randomize:
         attacks = random_battles("off", None, limit)
         defenses = random_battles("def", None, limit)
-    vals = derive_stats(attacks, defenses)
+    vals = derive_stats(attacks, defenses, coc_api.is_legend1(league))
     vals.update(name=str(name)[:NAME_MAX_CHARS], rank=str(rank)[:10],
                 attacks=attacks, defenses=defenses,
                 league=league, movement=movement, limit=limit)
@@ -408,6 +414,17 @@ def resolve(name, rank, attacks_txt, defenses_txt, randomize=False, league=None)
 
 
 sem = asyncio.Semaphore(1)   # one render at a time keeps RAM low
+
+
+def text_width(d, text, max_w, size):
+    """Width the text gets after the same auto-shrink draw_text uses."""
+    font = None
+    while size > 20:
+        font = ImageFont.truetype(FONT_PATH, size)
+        if d.textlength(text, font=font) <= max_w:
+            break
+        size -= 2
+    return d.textlength(text, font=font)
 
 
 def draw_text(d, text, pos, max_w, size, anchor="mm"):
@@ -561,12 +578,12 @@ def draw_battle_box(img, d, x, y, stars, trophies, pct, kind):
                  STAR_ON if i < stars else STAR_OFF, BOX_STAR_R)
 
 
-def draw_battles(img, d, battles, x0, kind):
+def draw_battles(img, d, battles, x0, kind, legend1=False):
     for i, (stars, pct) in enumerate(battles[:MAX_BATTLES]):
         r, c = divmod(i, COLS)
         x = x0 + c * COL_PITCH
         y = GRID_Y0 + r * ROW_PITCH
-        trophies = attack_trophies(stars, pct) if kind == "off" else defense_trophies(stars, pct)
+        trophies = attack_trophies(stars, pct) if kind == "off" else defense_trophies(stars, pct, legend1)
         draw_battle_box(img, d, x, y, stars, trophies, pct, kind)
 
 
@@ -632,8 +649,10 @@ def render(name: str, rank: str, off_total: int, def_total: int,
            off_avg: float, def_avg: float,
            off_dest: float, def_dest: float,
            attacks=None, defenses=None, league: str = DEFAULT_LEAGUE,
-           movement: str = DEFAULT_MOVEMENT, limit: int = 24, grid: bool = False) -> bytes:
-    total = off_total + def_total
+           movement: str = DEFAULT_MOVEMENT, limit: int = 24, grid: bool = False,
+           total_override: Optional[int] = None) -> bytes:
+    # normally the total is off + def; Legend I passes the player's real trophy count instead
+    total = off_total + def_total if total_override is None else total_override
     img = make_canvas(limit)
     d = ImageDraw.Draw(img)
 
@@ -646,8 +665,14 @@ def render(name: str, rank: str, off_total: int, def_total: int,
             d.line([(0, y), (img.width, y)], fill="#00ffff", width=1)
             d.text((3, y + 3), str(y), font=small, fill="#00ffff")
 
-    draw_text(d, name, NAME_POS, NAME_MAX_W, NAME_SIZE, anchor="lm")
-    draw_text(d, rank, RANK_POS, RANK_MAX_W, RANK_SIZE)
+    legend1 = _norm(league) == "legendi"
+    if legend1:   # no banner: rank at the left edge, name starts after it with a gap
+        rank_w = text_width(d, rank, RANK_MAX_W, RANK_SIZE) + 8   # +8 for the outline
+        draw_text(d, rank, (RANK_L1_X, NAME_POS[1]), RANK_MAX_W, RANK_SIZE, anchor="lm")
+        draw_text(d, name, (RANK_L1_X + rank_w + NAME_GAP_L1, NAME_POS[1]), NAME_MAX_W, NAME_SIZE, anchor="lm")
+    else:
+        draw_text(d, name, NAME_POS, NAME_MAX_W, NAME_SIZE, anchor="lm")
+        draw_text(d, rank, RANK_POS, RANK_MAX_W, RANK_SIZE)
     draw_cfg(d, str(total), TOTAL)
     draw_cfg(d, f"{off_total:+d}", OFF)
     draw_cfg(d, f"{def_total:+d}", DEF)
@@ -671,13 +696,13 @@ def render(name: str, rank: str, off_total: int, def_total: int,
 
     if BANNER_COVER:
         d.rectangle(BANNER_COVER[:4], fill=BANNER_COVER[4])
-    banner = get_asset(BANNER_FILES.get(movement, ""), BANNER_H)
+    banner = None if legend1 else get_asset(BANNER_FILES.get(movement, ""), BANNER_H)
     if banner:
         img.paste(banner, (int(BANNER_POS[0] - banner.width / 2),
                            int(BANNER_POS[1] - banner.height / 2)), banner)
 
-    draw_battles(img, d, attacks or [], GRID_X_OFF, "off")
-    draw_battles(img, d, defenses or [], GRID_X_DEF, "def")
+    draw_battles(img, d, attacks or [], GRID_X_OFF, "off", legend1)
+    draw_battles(img, d, defenses or [], GRID_X_DEF, "def", legend1)
 
     buf = io.BytesIO()
     img.save(buf, "PNG")
@@ -690,16 +715,35 @@ log = logging.getLogger("cocbot")
 POLL_INTERVAL = 900   # seconds between battlelog polls (15 minutes)
 
 
+# ONE-TIME cleanup: put your server IDs here, run the bot once, then delete this list and the loop below
+CLEAN_GUILDS = [
+    1167707509813940245,
+    1484407577004736525,
+]
+
+
 class CocClient(discord.Client):
     async def setup_hook(self):
         await asyncio.to_thread(coc_db.init)
         await tree.sync()
+
+        for gid in CLEAN_GUILDS:
+            obj = discord.Object(id=gid)
+            tree.clear_commands(guild=obj)
+            try:
+                await tree.sync(guild=obj)
+                log.info("cleared guild commands in %s", gid)
+            except discord.HTTPException as e:
+                log.warning("couldn't clear %s: %s", gid, e)
+
         self._poller = asyncio.create_task(poll_loop())
+        self._trophy_task = asyncio.create_task(trophy_loop())
 
     async def close(self):
-        poller = getattr(self, "_poller", None)
-        if poller:
-            poller.cancel()
+        for name in ("_poller", "_trophy_task"):
+            task = getattr(self, name, None)
+            if task:
+                task.cancel()
         await coc_api.close()
         await super().close()
 
@@ -724,6 +768,14 @@ def safe_name(name):
 # in their league group, so the offense/defense leaderboards are complete ----
 NAME_REFRESH_EVERY = 4    # every 4th poll (about hourly at 15 min): names, league groups and pruning are refreshed
 POLL_CONCURRENCY = 8      # simultaneous battlelog requests (coc_api.COC_RATE sets the real speed)
+
+# ---- Legend I only: opponents found in battle logs are added to the watch list ----
+LEGEND1_GROUP_KEY = "legend1"        # same group the legend1_import.py script uses
+LEGEND1_EXPIRES_DAYS = 365           # how long a discovered player stays watched
+LEGEND1_MAX_NEW_PER_CYCLE = 200      # max opponents checked/added per poll cycle (limits API load)
+LEGEND1_REJECT_HOURS = 6             # don't re-check an opponent that wasn't Legend I for this long
+_not_legend1 = {}                    # opponent tag -> time until which it is skipped
+TROPHY_REFRESH_INTERVAL = 3600       # seconds between Legend I trophy refreshes (for the approximate rank)
 
 
 def group_pairs(members):
@@ -764,6 +816,97 @@ async def sync_groups(rows):
         await watch_player_group(player, row["tag"], seen)
 
 
+async def discover_legend1(cands):
+    """cands = opponent tags seen in Legend I battles that aren't watched yet.
+    Confirms each with /players (also gives the name) and adds the Legend I ones to the watch list."""
+    loop = asyncio.get_running_loop()
+    now = loop.time()
+    for k in [k for k, until in _not_legend1.items() if until < now]:
+        del _not_legend1[k]
+    cands = [t for t in cands if t not in _not_legend1][:LEGEND1_MAX_NEW_PER_CYCLE]
+    if not cands:
+        return
+    gate = asyncio.Semaphore(POLL_CONCURRENCY)
+    found, trophies = [], []
+
+    async def check(tag):
+        async with gate:
+            try:
+                p = await coc_api.get_player(tag)
+            except coc_api.CocError as e:
+                log.warning("legend1 check #%s: %s", tag, e)
+                return
+        if coc_api.is_legend1((p.get("leagueTier") or {}).get("name")):
+            found.append((tag, p.get("name") or "Unknown"))
+            if p.get("trophies") is not None:
+                trophies.append((tag, p["trophies"]))
+        else:
+            _not_legend1[tag] = loop.time() + LEGEND1_REJECT_HOURS * 3600
+
+    await asyncio.gather(*(check(t) for t in cands))
+    if not found:
+        return
+    expires = datetime.now(timezone.utc) + timedelta(days=LEGEND1_EXPIRES_DAYS)
+    ok = await asyncio.to_thread(coc_db.watch_group, LEGEND1_GROUP_KEY, found, expires)
+    if ok:
+        await asyncio.to_thread(coc_db.set_trophies_many, trophies)
+        log.info("added %d new Legend I players found as opponents", len(found))
+    else:
+        log.warning("watch list full (%d): %d new Legend I players not added",
+                    coc_db.MAX_WATCHED, len(found))
+
+
+async def refresh_legend_trophies():
+    """Reload the trophies of everyone on the Legend I list (used for the approximate rank).
+    Players who are no longer in Legend I are dropped from the list."""
+    tags = await asyncio.to_thread(coc_db.list_legend_tags)
+    if not tags:
+        return
+    loop = asyncio.get_running_loop()
+    t0 = loop.time()
+    queue = asyncio.Queue()
+    for t in tags:
+        queue.put_nowait(t)
+    got, gone = [], []
+
+    async def worker():
+        while True:
+            try:
+                tag = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            try:
+                p = await coc_api.get_player(tag)
+            except coc_api.CocError:
+                continue
+            tier = (p.get("leagueTier") or {}).get("name")
+            if tier and not coc_api.is_legend1(tier):
+                gone.append(tag)
+            elif p.get("trophies") is not None:
+                got.append((tag, p["trophies"]))
+
+    await asyncio.gather(*(worker() for _ in range(POLL_CONCURRENCY)))
+    await asyncio.to_thread(coc_db.set_trophies_many, got)
+    if gone:
+        await asyncio.to_thread(coc_db.drop_legend, gone)
+    log.info("legend I trophies: %d updated, %d left Legend I, %.0fs",
+             len(got), len(gone), loop.time() - t0)
+
+
+async def trophy_loop():
+    await client.wait_until_ready()
+    loop = asyncio.get_running_loop()
+    while True:
+        started = loop.time()
+        try:
+            await refresh_legend_trophies()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("legend trophy refresh failed")
+        await asyncio.sleep(max(60, TROPHY_REFRESH_INTERVAL - (loop.time() - started)))
+
+
 async def poll_once(refresh=False):
     loop = asyncio.get_running_loop()
     t0 = loop.time()
@@ -773,6 +916,7 @@ async def poll_once(refresh=False):
     tags = await asyncio.to_thread(coc_db.list_poll_tags)
     gate = asyncio.Semaphore(POLL_CONCURRENCY)
     new_total = 0
+    opp_tags = set()   # opponents seen in Legend I battles this cycle
 
     async def one(tag):
         nonlocal new_total
@@ -782,8 +926,10 @@ async def poll_once(refresh=False):
             except coc_api.CocError as e:
                 log.warning("poll #%s: %s", tag, e)
                 return
+        battles = coc_api.extract_ranked(items)
+        opp_tags.update(b["opp"] for b in battles if b.get("legend") and b.get("opp"))
         try:
-            n = await asyncio.to_thread(coc_db.save_battles, tag, coc_api.extract_ranked(items))
+            n = await asyncio.to_thread(coc_db.save_battles, tag, battles)
         except Exception:
             log.exception("saving #%s failed", tag)
             return
@@ -803,6 +949,7 @@ async def poll_once(refresh=False):
             await one(tag)
 
     await asyncio.gather(*(worker() for _ in range(POLL_CONCURRENCY)))
+    await discover_legend1(sorted(opp_tags - set(tags)))
     if refresh:
         await asyncio.to_thread(coc_db.prune)
     log.info("polled %d players, %d new ranked battles in %.0fs",
@@ -924,7 +1071,7 @@ def build_group_stats(league, group_data):
     out = {}
     for g in group_data:
         att, dfn = g["attacks"][:limit], g["defenses"][:limit]
-        v = derive_stats(att, dfn)
+        v = derive_stats(att, dfn, coc_api.is_legend1(league))
         v.update(n_att=len(att), n_def=len(dfn), ok=g["ok"])
         out[g["tag"]] = v
     return out
@@ -1178,8 +1325,8 @@ async def tracked_autocomplete(inter: discord.Interaction, current: str):
     return out
 
 
-# ---- /coc : manual input ----
-@tree.command(name="coc", description="Generate the trophy summary image from typed battles")
+# ---- /larp : manual input ----
+@tree.command(name="larp", description="Generate the trophy summary image from typed battles")
 @app_commands.describe(
     name="Player name (max 15 characters)",
     rank="Player rank 1-100 in the league (decides promotion/demotion banner)",
@@ -1317,10 +1464,17 @@ async def battle_log(inter: discord.Interaction, player: Optional[PlayerT] = Non
     att = " ".join(f"{s}:{p}" for s, p in data["attacks"][:limit])
     dfn = " ".join(f"{s}:{p}" for s, p in data["defenses"][:limit])
     rank = f"#{data['rank']}" if data["rank"] else "-"
+    if coc_api.is_legend1(data["league"]) and data.get("trophies") is not None:
+        # Legend I has no league group: approximate rank among the Legend I players collected so far
+        pos, counted = await asyncio.to_thread(coc_db.legend_rank, data["trophies"], clean)
+        if counted:
+            rank = f"#{pos}"
     vals, err = resolve(data["name"], rank, att, dfn, False, data["league"])
     if err:
         await inter.followup.send(err)
         return
+    if coc_api.is_legend1(data["league"]) and data.get("trophies") is not None:
+        vals["total_override"] = data["trophies"]   # Legend I: real trophies from /players
 
     if cached and data["members"] and data["group_key"]:   # registered player: track the whole group
         gk = f"{data['group_key'][0]}/{data['group_key'][1]}"

@@ -13,7 +13,7 @@ from pathlib import Path
 DB_PATH = Path(__file__).parent / "coc.db"
 KEEP_DAYS = 21        # battles older than this are deleted
 MAX_TRACKED = 100     # max registered players
-MAX_PER_USER = 5      # players one Discord user can register
+MAX_PER_USER = 15   # players one Discord user can register
 MAX_WATCHED = 10000   # max players polled only because they share a league group (100 per group)
 _FMT = "%Y-%m-%dT%H:%M:%S"
 
@@ -54,6 +54,9 @@ def init():
                 tag TEXT PRIMARY KEY, name TEXT, group_key TEXT NOT NULL,
                 since TEXT NOT NULL, primed INTEGER NOT NULL DEFAULT 0, expires TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS watched_group ON watched (group_key);
+            CREATE TABLE IF NOT EXISTS legend_trophies (
+                tag TEXT PRIMARY KEY, trophies INTEGER NOT NULL, updated TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS legend_trophies_t ON legend_trophies (trophies);
         """)
 
 
@@ -160,6 +163,45 @@ def list_poll_tags():
         return [r[0] for r in c.execute("SELECT tag FROM tracked UNION SELECT tag FROM watched")]
 
 
+# ---- Legend I: trophies of every player in the "legend1" watch group (for the approximate rank) ----
+LEGEND_GROUP = "legend1"
+
+
+def list_legend_tags():
+    """Everyone on the Legend I watch list."""
+    with _db() as c:
+        return [r[0] for r in c.execute("SELECT tag FROM watched WHERE group_key=?", (LEGEND_GROUP,))]
+
+
+def set_trophies_many(pairs):
+    """pairs = [(tag, trophies)]. Overwrites the stored value."""
+    now = _now()
+    with _db() as c:
+        c.executemany("INSERT OR REPLACE INTO legend_trophies (tag, trophies, updated) VALUES (?,?,?)",
+                      [(t, int(n), now) for t, n in pairs])
+
+
+def drop_legend(tags):
+    """Players who are no longer Legend I: remove their trophies and stop watching them."""
+    tags = list(tags)
+    with _db() as c:
+        for i in range(0, len(tags), 500):
+            chunk = tags[i:i + 500]
+            q = ",".join("?" * len(chunk))
+            c.execute(f"DELETE FROM legend_trophies WHERE tag IN ({q})", chunk)
+            c.execute(f"DELETE FROM watched WHERE group_key=? AND tag IN ({q})", [LEGEND_GROUP, *chunk])
+
+
+def legend_rank(trophies, tag=None):
+    """(rank, players counted): 1 + how many stored players have more trophies. `tag` is left out."""
+    tag = tag or ""
+    with _db() as c:
+        total = c.execute("SELECT COUNT(*) FROM legend_trophies WHERE tag != ?", (tag,)).fetchone()[0]
+        ahead = c.execute("SELECT COUNT(*) FROM legend_trophies WHERE trophies > ? AND tag != ?",
+                          (trophies, tag)).fetchone()[0]
+    return ahead + 1, total
+
+
 # ---- battles ----
 def save_battles_many(by_tag):
     """by_tag = {tag: [battle dicts from coc_api.extract_ranked]}. One transaction.
@@ -214,3 +256,4 @@ def prune():
         c.execute("DELETE FROM battles WHERE time < ?", (cutoff,))
         c.execute("DELETE FROM battles WHERE tag NOT IN "
                   "(SELECT tag FROM tracked UNION SELECT tag FROM watched)")
+        c.execute("DELETE FROM legend_trophies WHERE tag NOT IN (SELECT tag FROM watched)")

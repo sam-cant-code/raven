@@ -1,8 +1,10 @@
 """Clash of Clans API helpers.
 
-player tag -> /players (name, league, group tag, season id)
+player tag -> /players (name, league, group tag, season id, trophies)
            -> /leaguegroup (rank = position in the members list, plus the full table)
            -> /battlelog (ranked battles inside the current window)
+
+Legend I has no league group: it only uses /players and /battlelog.
 """
 import asyncio
 import logging
@@ -43,6 +45,9 @@ WEEK = timedelta(days=7)
 
 TAG_CHARS = "0289PYLQGRJCUV"       # the only characters a CoC tag can contain
 _TAG_RE = re.compile(rf"[{TAG_CHARS}]{{3,12}}")
+
+# battleType values that count as ranked battles. Legend I reports "legend" instead of "ranked".
+RANKED_TYPES = ("ranked", "legend")
 
 
 log = logging.getLogger("cocbot")
@@ -87,11 +92,12 @@ def parse_ts(s):
 def extract_ranked(items, now=None):
     """Ranked battles from a battlelog 'items' list, as dicts:
     {key, attack, stars, pct, time}. `key` identifies a battle so it is never stored twice.
+    Accepts battleType "ranked" and "legend" (Legend I).
     If the API ever leaves out battleTimestamp, the time we first saw the battle is used."""
     now = now or datetime.now(timezone.utc)
     out = []
     for it in items or []:
-        if it.get("battleType") != "ranked":
+        if it.get("battleType") not in RANKED_TYPES:
             continue
         try:
             stars, pct = int(it["stars"]), int(it["destructionPercentage"])
@@ -108,7 +114,8 @@ def extract_ranked(items, now=None):
             key = f"{ts}|{opp}|{int(attack)}"
         else:
             key = f"?|{opp}|{int(attack)}|{stars}|{pct}|{it.get('armyShareCode')}"
-        out.append({"key": key, "attack": attack, "stars": stars, "pct": pct, "time": t or now})
+        out.append({"key": key, "attack": attack, "stars": stars, "pct": pct, "time": t or now,
+                    "opp": normalize_tag(opp), "legend": it.get("battleType") == "legend"})
     return out
 
 
@@ -253,7 +260,8 @@ async def fetch_group_members(group_tag, season_id, tag):
 async def fetch_summary(tag, stored=None):
     """tag = normalized tag (no #); stored = battles from coc_db.load_battles (optional).
     Returns name, league, rank, attacks, defenses, window, the live ranked battles,
-    and the full league group members list (for the league table)."""
+    the player's real trophies (from /players), and the full league group members list
+    (for the league table). Legend I never calls /leaguegroup."""
     player = await get_player(tag)
     name = player.get("name") or "Unknown"
     league = (player.get("leagueTier") or {}).get("name")
@@ -287,6 +295,7 @@ async def fetch_summary(tag, stored=None):
     return {"name": name, "league": league, "rank": rank, "attacks": attacks,
             "defenses": defenses, "window": (start, end), "live": live,
             "members": members, "tag": tag,
+            "trophies": player.get("trophies"),
             "group_key": (group_tag, season_id) if members else None}
 
 
