@@ -5,14 +5,29 @@ player tag -> /players (name, league, group tag, season id)
            -> /battlelog (ranked battles inside the current window)
 """
 import asyncio
+import logging
 import os
 import re
+import time
 from datetime import datetime, timedelta, timezone
 
 # Clash of Clans API token (a JWT from https://developer.clashofclans.com).
 # It is sent as "Authorization: Bearer <token>" on EVERY API request.
 COC_API_TOKEN = ""   # put it in the .env file (COC_API_TOKEN=...) or paste it here
 COC_API_TOKEN = (COC_API_TOKEN or os.environ.get("COC_API_TOKEN", "")).strip()
+
+
+def _collect_tokens():
+    """COC_API_TOKEN plus any number of extra keys in COC_API_TOKENS (comma or space separated)."""
+    out = []
+    for t in [COC_API_TOKEN, *re.split(r"[,\s;]+", os.environ.get("COC_API_TOKENS", ""))]:
+        t = t.strip()
+        if t and t not in out:
+            out.append(t)
+    return out
+
+
+COC_API_TOKENS = _collect_tokens()
 BASE_URL = "https://api.clashofclans.com/v1"
 
 # ---- tournament windows (all GMT/UTC) ----
@@ -21,6 +36,9 @@ WEEK = timedelta(days=7)
 
 TAG_CHARS = "0289PYLQGRJCUV"       # the only characters a CoC tag can contain
 _TAG_RE = re.compile(rf"[{TAG_CHARS}]{{3,12}}")
+
+
+log = logging.getLogger("cocbot")
 
 
 class CocError(Exception):
@@ -112,36 +130,84 @@ def find_rank(members, tag):
 
 # ---- HTTP ----
 _session = None
+COC_RATE = 20           # max requests per second PER KEY (the API tolerates roughly 30 per key)
+KEY_BLOCK_SECONDS = 5   # a key that got a 429 rests this long, other keys carry on
+KEY_DEAD_SECONDS = 600  # a key that got a 403 (wrong IP / revoked) is skipped this long
+
+
+class _Key:
+    def __init__(self, token):
+        self.token = token
+        self.next_slot = 0.0       # earliest time this key may send its next request
+        self.blocked_until = 0.0   # 429 cooldown
+        self.dead_until = 0.0      # 403 cooldown
+
+
+_keys = [_Key(t) for t in COC_API_TOKENS]
+
+
+async def _acquire():
+    """Pick the usable key whose next slot comes first, reserve that slot and wait for it.
+    With N keys the bot's total speed is N * COC_RATE."""
+    loop = asyncio.get_running_loop()
+    while True:
+        now = loop.time()
+        live = [k for k in _keys if k.dead_until <= now]
+        if not live:
+            raise CocError("The API rejected every key (wrong token, or this server's IP isn't allowed for it).")
+        ready = [k for k in live if k.blocked_until <= now]
+        if ready:
+            k = min(ready, key=lambda k: k.next_slot)
+            slot = max(now, k.next_slot)
+            k.next_slot = slot + 1.0 / COC_RATE
+            if slot > now:
+                await asyncio.sleep(slot - now)
+            return k
+        await asyncio.sleep(max(0.05, min(k.blocked_until for k in live) - now))   # all keys resting
 
 
 async def _get(path):
-    """GET BASE_URL + path (path already contains %23 for every #). Returns parsed JSON."""
+    """GET BASE_URL + path (path already contains %23 for every #). Returns parsed JSON.
+    A 429 or 403 on one key is retried on another key when there is one."""
     global _session
     import aiohttp
     from yarl import URL
-    if not COC_API_TOKEN:
+    if not _keys:
         raise CocError("The bot has no Clash of Clans API token set (COC_API_TOKEN).")
     if _session is None or _session.closed:
-        _session = aiohttp.ClientSession(
-            headers={"Authorization": f"Bearer {COC_API_TOKEN}", "Accept": "application/json"},
-            timeout=aiohttp.ClientTimeout(total=15))
-    try:
-        async with _session.get(URL(BASE_URL + path, encoded=True)) as r:
-            if r.status == 200:
-                return await r.json()
-            if r.status == 404:
-                raise CocError("Not found. Check the player tag.")
-            if r.status == 403:
-                raise CocError("The API rejected the bot's key (wrong token, or this server's IP isn't allowed for it).")
-            if r.status == 429:
-                raise CocError("Too many requests right now. Try again in a moment.")
-            if r.status == 503:
-                raise CocError("The Clash of Clans API is down for maintenance.")
-            raise CocError(f"The API returned an error ({r.status}).")
-    except asyncio.TimeoutError:
-        raise CocError("The Clash of Clans API took too long to answer.")
-    except aiohttp.ClientError:
-        raise CocError("Couldn't reach the Clash of Clans API.")
+        _session = aiohttp.ClientSession(headers={"Accept": "application/json"},
+                                         timeout=aiohttp.ClientTimeout(total=15))
+    loop = asyncio.get_running_loop()
+    last = CocError("Too many requests right now. Try again in a moment.")
+    for _ in range(len(_keys) + 1):
+        key = await _acquire()
+        try:
+            async with _session.get(URL(BASE_URL + path, encoded=True),
+                                    headers={"Authorization": f"Bearer {key.token}"}) as r:
+                if r.status == 200:
+                    return await r.json()
+                if r.status == 404:
+                    raise CocError("Not found. Check the player tag.")
+                if r.status == 429:
+                    key.blocked_until = loop.time() + KEY_BLOCK_SECONDS
+                    last = CocError("Too many requests right now. Try again in a moment.")
+                    continue
+                if r.status == 403:
+                    last = CocError("The API rejected the bot's key (wrong token, or this server's IP isn't allowed for it).")
+                    if len(_keys) > 1:
+                        key.dead_until = loop.time() + KEY_DEAD_SECONDS
+                        log.warning("API key ...%s was rejected (403); skipping it for %d s",
+                                    key.token[-6:], KEY_DEAD_SECONDS)
+                        continue
+                    raise last
+                if r.status == 503:
+                    raise CocError("The Clash of Clans API is down for maintenance.")
+                raise CocError(f"The API returned an error ({r.status}).")
+        except asyncio.TimeoutError:
+            raise CocError("The Clash of Clans API took too long to answer.")
+        except aiohttp.ClientError:
+            raise CocError("Couldn't reach the Clash of Clans API.")
+    raise last
 
 
 async def close():
@@ -158,6 +224,23 @@ async def get_player(tag):
 async def get_battlelog(tag):
     """Raw battlelog 'items' list."""
     return (await _get(f"/players/%23{tag}/battlelog")).get("items", [])
+
+
+def group_ref(player):
+    """(group_tag, season_id) of the player's current league group, or None
+    (no league, Legend I which has no group, or no active season)."""
+    league = (player.get("leagueTier") or {}).get("name")
+    group_tag = (player.get("currentLeagueGroupTag") or "").lstrip("#")
+    season_id = player.get("currentLeagueSeasonId")
+    if not league or is_legend1(league) or not group_tag or not season_id:
+        return None
+    return group_tag, season_id
+
+
+async def fetch_group_members(group_tag, season_id, tag):
+    """(members list, season end datetime) of a league group."""
+    g = await _get(f"/leaguegroup/%23{group_tag}/{season_id}?playerTag=%23{tag}")
+    return g.get("members") or [], season_window(season_id)[1]
 
 
 async def fetch_summary(tag, stored=None):
@@ -185,7 +268,8 @@ async def fetch_summary(tag, stored=None):
             return []
         try:
             g = await _get(f"/leaguegroup/%23{group_tag}/{season_id}?playerTag=%23{tag}")
-        except CocError:
+        except CocError as e:
+            log.warning("league group of #%s could not be loaded (no League Table button): %s", tag, e)
             return []   # optional: the image still renders without it
         return g.get("members") or []
 
@@ -195,4 +279,53 @@ async def fetch_summary(tag, stored=None):
     attacks, defenses = split_window(merge_battles(stored, live), start, end)
     return {"name": name, "league": league, "rank": rank, "attacks": attacks,
             "defenses": defenses, "window": (start, end), "live": live,
-            "members": members, "tag": tag}
+            "members": members, "tag": tag,
+            "group_key": (group_tag, season_id) if members else None}
+
+
+# ---- every member of a league group (for the offense / defense leaderboards) ----
+GROUP_CACHE_TTL = 300      # seconds a group's battle logs are reused (shared by everyone who clicks)
+GROUP_CONCURRENCY = 10     # simultaneous battlelog requests, stays well under the rate limit
+_group_cache = {}          # group_key -> (monotonic time, result)
+
+
+async def fetch_group_battles(members, start, end, key=None, stored=None, live=True):
+    """Every league member -> [{tag, name, attacks, defenses, ok, fresh}], where attacks/defenses
+    are (stars, pct) lists inside [start, end) and fresh = the ranked battles just fetched.
+    stored = {tag: [battle dicts]} (saved by the poller) is always merged in.
+    live=False skips the API completely (use it when the poller already has everyone).
+    Live results are cached per league group for GROUP_CACHE_TTL seconds."""
+    now = time.monotonic()
+    use_cache = live and key is not None
+    hit = _group_cache.get(key) if use_cache else None
+    if hit and now - hit[0] < GROUP_CACHE_TTL:
+        return hit[1]
+    gate = asyncio.Semaphore(GROUP_CONCURRENCY)
+    stored = stored or {}
+
+    async def one(m):
+        tag = normalize_tag(m.get("playerTag"))
+        if not tag:
+            return None
+        fresh, ok = [], True
+        if live:
+            async with gate:
+                for attempt in (1, 2):
+                    try:
+                        fresh = extract_ranked(await get_battlelog(tag))
+                        break
+                    except CocError:
+                        if attempt == 2:
+                            ok = False
+                        else:
+                            await asyncio.sleep(1)
+        att, dfn = split_window(merge_battles(stored.get(tag), fresh), start, end)
+        return {"tag": tag, "name": m.get("playerName") or "Unknown",
+                "attacks": att, "defenses": dfn, "ok": ok, "fresh": fresh}
+
+    result = [r for r in await asyncio.gather(*(one(m) for m in members)) if r]
+    if use_cache and sum(not r["ok"] for r in result) <= 5:   # don't cache a badly failed round
+        for k in [k for k, (t, _) in _group_cache.items() if now - t > GROUP_CACHE_TTL]:
+            del _group_cache[k]
+        _group_cache[key] = (now, result)
+    return result

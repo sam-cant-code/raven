@@ -1,4 +1,5 @@
-import io, math, asyncio, re, random, os, logging
+import io, math, asyncio, re, random, os, logging, unicodedata
+from datetime import timedelta
 from pathlib import Path
 from typing import Literal, Optional
 
@@ -687,7 +688,6 @@ def render(name: str, rank: str, off_total: int, def_total: int,
 # ---- discord.py part ----
 log = logging.getLogger("cocbot")
 POLL_INTERVAL = 300   # seconds between battlelog polls (5 minutes)
-POLL_GAP = 0.3        # pause between two players, keeps us far below the API rate limit
 
 
 class CocClient(discord.Client):
@@ -720,41 +720,93 @@ def safe_name(name):
     return discord.utils.escape_mentions(discord.utils.escape_markdown(name or "Unknown"))
 
 
-# ---- background poller: saves every new ranked battle of tracked players ----
-NAME_REFRESH_EVERY = 12   # every 12th poll (about hourly) the cached player names are refreshed
+# ---- background poller: saves every new ranked battle of tracked players AND of everyone
+# in their league group, so the offense/defense leaderboards are complete ----
+NAME_REFRESH_EVERY = 12   # every 12th poll (about hourly): names, league groups and pruning are refreshed
+POLL_CONCURRENCY = 8      # simultaneous battlelog requests (coc_api.COC_RATE sets the real speed)
 
 
-async def poll_once(refresh_names=False):
-    rows = await asyncio.to_thread(coc_db.list_tracked)
-    new_total = 0
+def group_pairs(members):
+    pairs = [(coc_api.normalize_tag(m.get("playerTag")), m.get("playerName") or "Unknown") for m in members]
+    return [(t, n) for t, n in pairs if t]
+
+
+async def watch_player_group(player, tag, seen=None):
+    """Make sure every member of the player's league group is polled until the season ends."""
+    ref = coc_api.group_ref(player)
+    if not ref or (seen is not None and ref in seen):
+        return
+    if seen is not None:
+        seen.add(ref)
+    try:
+        members, end = await coc_api.fetch_group_members(ref[0], ref[1], tag)
+    except coc_api.CocError as e:
+        log.warning("group of #%s: %s", tag, e)
+        return
+    ok = await asyncio.to_thread(coc_db.watch_group, f"{ref[0]}/{ref[1]}", group_pairs(members), end)
+    if not ok:
+        log.warning("watch list full (%d): group %s is not tracked", coc_db.MAX_WATCHED, ref[0])
+
+
+async def sync_groups(rows):
+    """Refresh names and (re)register the league group of every tracked player.
+    Players in the same group are only fetched once."""
+    seen = set()
     for row in rows:
         try:
-            items = await coc_api.get_battlelog(row["tag"])
-            new_total += await asyncio.to_thread(coc_db.save_battles, row["tag"],
-                                                 coc_api.extract_ranked(items))
-            if refresh_names:
-                name = (await coc_api.get_player(row["tag"])).get("name")
-                if name and name != row["name"]:
-                    await asyncio.to_thread(coc_db.update_name, row["tag"], name)
+            player = await coc_api.get_player(row["tag"])
         except coc_api.CocError as e:
-            log.warning("poll #%s: %s", row["tag"], e)
-        await asyncio.sleep(POLL_GAP)
-    await asyncio.to_thread(coc_db.prune)
-    log.info("polled %d players, %d new ranked battles", len(rows), new_total)
+            log.warning("sync #%s: %s", row["tag"], e)
+            continue
+        name = player.get("name")
+        if name and name != row["name"]:
+            await asyncio.to_thread(coc_db.update_name, row["tag"], name)
+        await watch_player_group(player, row["tag"], seen)
+
+
+async def poll_once(refresh=False):
+    rows = await asyncio.to_thread(coc_db.list_tracked)
+    if refresh:
+        await sync_groups(rows)
+    tags = await asyncio.to_thread(coc_db.list_poll_tags)
+    gate = asyncio.Semaphore(POLL_CONCURRENCY)
+    new_total = 0
+
+    async def one(tag):
+        nonlocal new_total
+        async with gate:
+            try:
+                items = await coc_api.get_battlelog(tag)
+            except coc_api.CocError as e:
+                log.warning("poll #%s: %s", tag, e)
+                return
+        try:
+            n = await asyncio.to_thread(coc_db.save_battles, tag, coc_api.extract_ranked(items))
+        except Exception:
+            log.exception("saving #%s failed", tag)
+            return
+        new_total += n
+
+    await asyncio.gather(*(one(t) for t in tags))
+    if refresh:
+        await asyncio.to_thread(coc_db.prune)
+    log.info("polled %d players, %d new ranked battles", len(tags), new_total)
 
 
 async def poll_loop():
     await client.wait_until_ready()
+    loop = asyncio.get_running_loop()
     cycle = 0
     while True:
+        started = loop.time()
         try:
-            await poll_once(refresh_names=(cycle % NAME_REFRESH_EVERY == 0))
+            await poll_once(refresh=(cycle % NAME_REFRESH_EVERY == 0))
         except asyncio.CancelledError:
             raise
         except Exception:
             log.exception("poll failed")
         cycle += 1
-        await asyncio.sleep(POLL_INTERVAL)
+        await asyncio.sleep(max(30, POLL_INTERVAL - (loop.time() - started)))
 
 
 async def send_image(inter, vals, view=None):
@@ -765,67 +817,298 @@ async def send_image(inter, vals, view=None):
     return await inter.followup.send(file=discord.File(io.BytesIO(data), "out.png"), **kwargs)
 
 
-# ---- league table: button on /battle_log -> paginated list of the 100 players ----
-TABLE_PAGE_SIZE = 10   # 10 players per page -> 10 pages for 100 players
+# ---- league table: button on /battle_log -> paginated leaderboards for the 100 players ----
+TABLE_PAGE_SIZE = 20   # one line per player -> 20 per page, 5 pages for 100 players
+MODE_LABELS = {"trophies": "🏆 Trophies", "off": "⚔️ Offense", "def": "🛡️ Defense"}
+
+
+def player_link(name, tag):
+    """Player name that opens their in-game profile when clicked."""
+    label = safe_name(name).replace("[", "(").replace("]", ")")
+    if not tag:
+        return label
+    return f"[{label}](https://link.clashofclans.com/en?action=OpenPlayerProfile&tag=%23{tag})"
+
+
+def avg_stars(r, avg_key, count_key):
+    return f"{r[avg_key]:.2f}" if r.get(count_key) else "-"
+
+
+def per_battle(r, total_key, count_key):
+    """Trophies per battle, or a dash when there are no battles / no data yet."""
+    n = r.get(count_key)
+    return f"{r[total_key] / n:+.1f}" if n else "-"
+
+
+# ---- monospace table (inside a code block, so the columns line up) ----
+NAME_W = 14   # width of the Player column
+
+
+def disp_width(text):
+    """Columns a string takes in a monospace font: CJK / fullwidth / emoji count 2, accents 0."""
+    return sum(0 if unicodedata.combining(ch) else 2 if unicodedata.east_asian_width(ch) in "WF" else 1
+               for ch in text)
+
+
+def fit_cell(text, width, right=False):
+    """Clean, shorten (with an ellipsis) and pad a name to exactly `width` columns."""
+    text = "".join(ch for ch in (text or "") if unicodedata.category(ch) not in ("Cc", "Cf", "Cs", "Co"))
+    text = text.replace("`", "'").strip() or "Unknown"
+    if disp_width(text) > width:
+        while text and disp_width(text) > width - 1:
+            text = text[:-1]
+        text += "…"
+    pad = " " * (width - disp_width(text))
+    return pad + text if right else text + pad
+
+
+ESC = "\u001b"
+ANSI_RESET = f"{ESC}[0m"
+ANSI_HEAD = f"{ESC}[1;37m"                                  # bold white
+ANSI_ME = f"{ESC}[1;33m"                                    # bold yellow = gold
+ANSI_ZONE = {"promotion": f"{ESC}[0;32m", "demotion": f"{ESC}[0;31m"}   # green / red
+
+
+def cnt(n):
+    """Battle count shown after a total, e.g. 30 -> '(30)'."""
+    return f"({n})"
+
+
+def render_table(mode, rows, start, size, my_tag, zone_of):
+    """One page as an aligned text table for a ```ansi code block.
+    Your own row is gold and marked with '>'; in the trophy view promotion rows are green
+    and demotion rows red. The number in brackets after a total is how many battles it covers
+    (attacks done, or defenses taken)."""
+    if mode == "trophies":
+        cols = [("Troph", 8), ("Def", 4), ("Off", 4)]
+    else:
+        cols = [("Total", 9), ("Avg", 5)]
+    out = [ANSI_HEAD + f"{'#':>3}  {fit_cell('Player', NAME_W)}"
+           + "".join(f" {h:>{w}}" for h, w in cols) + ANSI_RESET]
+    for pos, r in enumerate(rows[start:start + size], start + 1):
+        if mode == "trophies":
+            vals = [str(r["trophies"]) + (cnt(r["n_att"]) if "n_att" in r else ""),
+                    avg_stars(r, "def_avg", "n_def"), avg_stars(r, "off_avg", "n_att")]
+        elif mode == "off":
+            vals = [f"{r.get('off_total', 0):+d}" + (cnt(r["n_att"]) if "n_att" in r else ""),
+                    per_battle(r, "off_total", "n_att")]
+        else:
+            vals = [f"{r.get('def_total', 0):+d}" + (cnt(r["n_def"]) if "n_def" in r else ""),
+                    per_battle(r, "def_total", "n_def")]
+        mine = r["tag"] == my_tag
+        line = (f"{pos:>3} {'>' if mine else ' '}{fit_cell(r['name'], NAME_W)}"
+                + "".join(f" {v:>{w}}" for v, (_, w) in zip(vals, cols)))
+        color = ANSI_ME if mine else (ANSI_ZONE.get(zone_of(pos)) if mode == "trophies" else None)
+        out.append(f"{color}{line}{ANSI_RESET}" if color else line)
+    return "\n".join(out)
+
+
+def build_group_stats(league, group_data):
+    """tag -> trophy totals / averages, computed with the same formulas as the image."""
+    limit = league_attacks(league)
+    out = {}
+    for g in group_data:
+        att, dfn = g["attacks"][:limit], g["defenses"][:limit]
+        v = derive_stats(att, dfn)
+        v.update(n_att=len(att), n_def=len(dfn), ok=g["ok"])
+        out[g["tag"]] = v
+    return out
+
+
+def find_profile_rows(rows, query, limit=5):
+    """'12' / '#12' -> the player at that position in the current list.
+    Anything else -> players whose name contains the text. Returns [(position, row)]."""
+    q = (query or "").strip().lstrip("#").strip()
+    if not q:
+        return []
+    if q.isdigit():
+        n = int(q)
+        return [(n, rows[n - 1])] if 1 <= n <= len(rows) else []
+    qc = q.casefold()
+    return [(i, r) for i, r in enumerate(rows, 1) if qc in (r["name"] or "").casefold()][:limit]
+
+
+class ProfileModal(discord.ui.Modal, title="Open a player's profile"):
+    query = discord.ui.TextInput(label="Rank number or player name", placeholder="e.g. 57 or Dude",
+                                 max_length=32)
+
+    def __init__(self, table):
+        super().__init__()
+        self.table = table
+
+    async def on_submit(self, inter: discord.Interaction):
+        hits = find_profile_rows(self.table.rows, self.query.value)
+        if not hits:
+            await inter.response.send_message("No player found. Type a rank (1-100) or part of a name.",
+                                              ephemeral=True)
+            return
+        lines = [f"`#{pos:<3}` {player_link(r['name'], r['tag'])}" for pos, r in hits]
+        await inter.response.send_message("\n".join(lines), ephemeral=True)
 
 
 class TableView(discord.ui.View):
-    """Paginated league table. Sent as an ephemeral message, so only the clicker sees it."""
+    """Paginated league leaderboards (trophies / offense / defense).
+    Sent as an ephemeral message, so only the clicker sees it."""
 
-    def __init__(self, league, members, my_tag):
-        super().__init__(timeout=300)
-        self.league = league
-        self.members = members
-        self.my_tag = my_tag
-        self.pages = max(1, math.ceil(len(members) / TABLE_PAGE_SIZE))
-        self.my_index = next((i for i, m in enumerate(members)
-                              if coc_api.normalize_tag(m.get("playerTag")) == my_tag), None)
-        self.page = (self.my_index // TABLE_PAGE_SIZE) if self.my_index is not None else 0
+    def __init__(self, league, members, my_tag, window, group_key, owner_id=None):
+        super().__init__(timeout=600)
+        self.owner_id = owner_id   # only this Discord user can press the buttons
+        self.league, self.members, self.my_tag = league, members, my_tag
+        self.window, self.group_key = window, group_key
+        self.mode = "trophies"
+        self.stats = None      # tag -> stats, loaded the first time Offense/Defense is opened
+        self.failed = 0        # players whose battle log couldn't be loaded
+        self.note = ""         # how complete the offense/defense data is
         self.inter = None
-        self.me_btn.disabled = self.my_index is None
-        self._sync()
+        self.page = 0
+        self._rebuild(jump_to_me=True)
 
-    def _sync(self):
+    # ---- data ----
+    def _rows(self):
+        rows = []
+        for i, m in enumerate(self.members, 1):
+            tag = coc_api.normalize_tag(m.get("playerTag"))
+            rows.append({"tag": tag, "name": m.get("playerName"), "clan": m.get("clanName"),
+                         "trophies": m.get("leagueTrophies", 0),
+                         **(self.stats.get(tag, {}) if self.stats else {})})
+        if self.mode == "off":      # more offense trophies is better
+            rows.sort(key=lambda r: (-r.get("off_total", 0), -r.get("off_dest", 0)))
+        elif self.mode == "def":    # more defense trophies kept is better, then less destruction
+            rows.sort(key=lambda r: (-r.get("def_total", 0), r.get("def_dest", 0)))
+        return rows
+
+    def _rebuild(self, jump_to_me=False):
+        self.rows = self._rows()
+        self.pages = max(1, math.ceil(len(self.rows) / TABLE_PAGE_SIZE))
+        mine = next((i for i, r in enumerate(self.rows) if r["tag"] == self.my_tag), None)
+        self.my_index = mine
+        if jump_to_me and mine is not None:
+            self.page = mine // TABLE_PAGE_SIZE
+        self.page = max(0, min(self.page, self.pages - 1))
+        self.me_btn.disabled = mine is None
         self.prev_btn.disabled = self.page <= 0
         self.next_btn.disabled = self.page >= self.pages - 1
         self.page_btn.label = f"{self.page + 1}/{self.pages}"
+        for mode, btn in (("trophies", self.trophies_btn), ("off", self.off_btn), ("def", self.def_btn)):
+            btn.style = discord.ButtonStyle.success if mode == self.mode else discord.ButtonStyle.secondary
 
     def embed(self):
-        start = self.page * TABLE_PAGE_SIZE
-        lines = []
-        for i, m in enumerate(self.members[start:start + TABLE_PAGE_SIZE], start + 1):
-            mtag = coc_api.normalize_tag(m.get("playerTag"))
-            zone = {"promotion": "🟢", "demotion": "🔴"}.get(movement_from_rank(self.league, i), "⚪")
-            pointer = "➤ " if mtag == self.my_tag else ""
-            name = safe_name(m.get("playerName"))
-            clan = safe_name(m.get("clanName")) if m.get("clanName") else "No clan"
-            lines.append(f"{zone} `#{i:<3}` {pointer}**{name}** · {m.get('leagueTrophies', 0)} 🏆\n"
-                         f"╰ {clan}")
-        e = discord.Embed(title=f"{self.league} · League Table",
-                          description="\n".join(lines), colour=discord.Colour.gold())
-        e.set_footer(text=f"Page {self.page + 1}/{self.pages} · 🟢 promotion  🔴 demotion")
+        zone_of = lambda pos: movement_from_rank(self.league, pos)
+        table = render_table(self.mode, self.rows, self.page * TABLE_PAGE_SIZE, TABLE_PAGE_SIZE,
+                             self.my_tag, zone_of)
+        desc = f"```ansi\n{table}\n```"
+        if self.note and self.stats is not None:
+            desc += "\n" + self.note
+        e = discord.Embed(title=f"{self.league} · {MODE_LABELS[self.mode]}",
+                          description=desc, colour=discord.Colour.gold())
+        legend = {"trophies": "gold = you · green/red = promotion/demotion · (n) = attacks done",
+                  "off": "gold = you · (n) = attacks · Avg = trophies per attack",
+                  "def": "gold = you · (n) = defenses taken · Avg = trophies per defense"}[self.mode]
+        if self.failed:
+            legend += f" · {self.failed} players couldn't be loaded"
+        e.set_footer(text=f"Page {self.page + 1}/{self.pages} · {legend}")
         return e
 
+    # ---- navigation ----
     async def _go(self, inter, page):
-        self.page = max(0, min(page, self.pages - 1))
-        self._sync()
+        self.page = page
+        self._rebuild()
         await inter.response.edit_message(embed=self.embed(), view=self)
 
-    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary, row=0)
     async def prev_btn(self, inter: discord.Interaction, button: discord.ui.Button):
         await self._go(inter, self.page - 1)
 
-    @discord.ui.button(label="1/1", style=discord.ButtonStyle.secondary, disabled=True)
+    @discord.ui.button(label="1/1", style=discord.ButtonStyle.secondary, disabled=True, row=0)
     async def page_btn(self, inter: discord.Interaction, button: discord.ui.Button):
         pass
 
-    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary, row=0)
     async def next_btn(self, inter: discord.Interaction, button: discord.ui.Button):
         await self._go(inter, self.page + 1)
 
-    @discord.ui.button(label="Me", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="Me", style=discord.ButtonStyle.primary, row=0)
     async def me_btn(self, inter: discord.Interaction, button: discord.ui.Button):
         await self._go(inter, self.my_index // TABLE_PAGE_SIZE)
+
+    # ---- mode switching ----
+    async def _load_stats(self):
+        """Offense/defense data for all 100 players.
+        Saved battles (from the poller) + live battle logs. When the poller already has every
+        member of the group, no API request is made at all."""
+        tags = [t for t in (coc_api.normalize_tag(m.get("playerTag")) for m in self.members) if t]
+        gk = f"{self.group_key[0]}/{self.group_key[1]}" if self.group_key else None
+        status = await asyncio.to_thread(coc_db.watch_status, tags)
+        here = {t: status[t] for t in tags if t in status and status[t]["group_key"] == gk}
+        covered = len(here) == len(tags) and all(v["primed"] for v in here.values())
+        stored = await asyncio.to_thread(coc_db.load_battles_many, tags)
+        start, end = self.window
+        group = await coc_api.fetch_group_battles(self.members, start, end, key=self.group_key,
+                                                  stored=stored, live=not covered)
+        if not covered and here:   # first look at this group: keep what we just fetched
+            fresh = {g["tag"]: g["fresh"] for g in group if g["ok"] and g["tag"] in here}
+            await asyncio.to_thread(coc_db.save_battles_many, fresh)
+        self.stats = build_group_stats(self.league, group)
+        self.failed = sum(1 for s in self.stats.values() if not s["ok"])
+
+        if len(here) < len(tags):
+            self.note = "ℹ️ Recent battle logs only (group not tracked continuously)."
+        else:
+            since = max(v["since"] for v in here.values())
+            if since <= start + timedelta(minutes=30):
+                self.note = "✅ Complete data for this week."
+            else:
+                self.note = (f"ℹ️ Tracked since {discord.utils.format_dt(since, 'f')}, earlier battles may be missing.")
+
+    async def _set_mode(self, inter, mode):
+        if mode == self.mode:
+            await inter.response.defer()
+            return
+        responded = False
+        if mode != "trophies" and self.stats is None:
+            loading = discord.Embed(title=f"{self.league} · {MODE_LABELS[mode]}",
+                                    description="Loading battle logs for all players…",
+                                    colour=discord.Colour.gold())
+            await inter.response.edit_message(embed=loading, view=None)   # no buttons while loading
+            responded = True
+            try:
+                await self._load_stats()
+            except Exception:
+                log.exception("league stats failed")
+                await inter.edit_original_response(embed=self.embed(), view=self)
+                await inter.followup.send("Couldn't load the battle logs. Try again in a moment.",
+                                          ephemeral=True)
+                return
+        self.mode = mode
+        self._rebuild(jump_to_me=True)
+        if responded:
+            await inter.edit_original_response(embed=self.embed(), view=self)
+        else:
+            await inter.response.edit_message(embed=self.embed(), view=self)
+
+    @discord.ui.button(label="Trophies", emoji="🏆", style=discord.ButtonStyle.success, row=1)
+    async def trophies_btn(self, inter: discord.Interaction, button: discord.ui.Button):
+        await self._set_mode(inter, "trophies")
+
+    @discord.ui.button(label="Offense", emoji="⚔️", style=discord.ButtonStyle.secondary, row=1)
+    async def off_btn(self, inter: discord.Interaction, button: discord.ui.Button):
+        await self._set_mode(inter, "off")
+
+    @discord.ui.button(label="Defense", emoji="🛡️", style=discord.ButtonStyle.secondary, row=1)
+    async def def_btn(self, inter: discord.Interaction, button: discord.ui.Button):
+        await self._set_mode(inter, "def")
+
+    @discord.ui.button(label="Profile", emoji="🔗", style=discord.ButtonStyle.secondary, row=0)
+    async def profile_btn(self, inter: discord.Interaction, button: discord.ui.Button):
+        await inter.response.send_modal(ProfileModal(self))
+
+    async def interaction_check(self, inter: discord.Interaction) -> bool:
+        if self.owner_id is not None and inter.user.id != self.owner_id:
+            await inter.response.send_message(
+                "This table belongs to someone else. Press 📊 League Table under the image to open your own.",
+                ephemeral=True)
+            return False
+        return True
 
     async def on_timeout(self):
         for child in self.children:
@@ -838,18 +1121,28 @@ class TableView(discord.ui.View):
 
 
 class BattleLogView(discord.ui.View):
-    """Attached to the /battle_log image. Opens the league table."""
+    """Attached to the /battle_log image. Opens the league leaderboards."""
 
-    def __init__(self, league, members, my_tag):
+    def __init__(self, league, members, my_tag, window, group_key):
         super().__init__(timeout=600)
         self.league, self.members, self.my_tag = league, members, my_tag
+        self.window, self.group_key = window, group_key
         self.message = None
 
-    @discord.ui.button(label="League Table", emoji="📊", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="View League Stats", emoji="📊", style=discord.ButtonStyle.primary)
     async def open_table(self, inter: discord.Interaction, button: discord.ui.Button):
-        view = TableView(self.league, self.members, self.my_tag)
-        await inter.response.send_message(embed=view.embed(), view=view, ephemeral=True)
+        view = TableView(self.league, self.members, self.my_tag, self.window, self.group_key,
+                         owner_id=inter.user.id)
         view.inter = inter
+        loading = discord.Embed(title=f"{self.league} · League Table",
+                                description="Loading battle logs…", colour=discord.Colour.gold())
+        await inter.response.send_message(embed=loading)   # public, but only the opener can click
+        try:
+            await view._load_stats()   # average stars need every player's battles
+        except Exception:
+            log.exception("league stats failed")   # the table still opens, stars show as –
+        view._rebuild(jump_to_me=True)
+        await inter.edit_original_response(embed=view.embed(), view=view)
 
     async def on_timeout(self):
         if self.message:
@@ -961,6 +1254,7 @@ async def track_player(inter: discord.Interaction, tag: TagT):
     name = player.get("name") or "Unknown"
     await asyncio.to_thread(coc_db.add_tracked, clean, name, inter.user.id)
     saved = await asyncio.to_thread(coc_db.save_battles, clean, coc_api.extract_ranked(items))
+    await watch_player_group(player, clean)   # also tracks the rest of their league group
     await inter.followup.send(
         f"Registered **{safe_name(name)}** (#{clean}). Saved {saved} ranked battles from the "
         f"current log; new ones are picked up every {POLL_INTERVAL // 60} minutes. "
@@ -1013,9 +1307,14 @@ async def battle_log(inter: discord.Interaction, player: Optional[PlayerT] = Non
         await inter.followup.send(err)
         return
 
+    if cached and data["members"] and data["group_key"]:   # registered player: track the whole group
+        gk = f"{data['group_key'][0]}/{data['group_key'][1]}"
+        await asyncio.to_thread(coc_db.watch_group, gk, group_pairs(data["members"]), data["window"][1])
+
     view = None
     if data["members"]:   # Legend I (and API failures) have no group -> no button
-        view = BattleLogView(data["league"], data["members"], clean)
+        view = BattleLogView(data["league"], data["members"], clean,
+                              data["window"], data["group_key"])
     msg = await send_image(inter, vals, view)
     if view:
         view.message = msg
@@ -1040,6 +1339,7 @@ async def untrack_player(inter: discord.Interaction, player: PlayerT):
             "Only the person who registered this player, or someone with Manage Server, can remove them.",
             ephemeral=True)
         return
+    await asyncio.to_thread(coc_db.drop_group_if_unused, clean)   # stop polling their league group
     await asyncio.to_thread(coc_db.remove_tracked, clean)
     await inter.response.send_message(f"Removed **{safe_name(row['name'])}** (#{clean}).")
 
@@ -1087,7 +1387,7 @@ def ask(label, cast, default=None):
 if __name__ == "__main__":
     print("Settings file:", ENV_PATH or f"NOT FOUND (looked for .env in {ROOT})")
     print("DISCORD_TOKEN:", "set" if TOKEN else "MISSING", "| COC_API_TOKEN:",
-          "set" if coc_api.COC_API_TOKEN else "MISSING")
+          f"{len(coc_api.COC_API_TOKENS)} key(s)" if coc_api.COC_API_TOKENS else "MISSING")
     if not TOKEN:
         print("No Discord token set -> local test mode (fill in TOKEN to run the bot).")
         name = ask("Name", str, "TestPlayer")
