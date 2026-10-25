@@ -11,10 +11,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 DB_PATH = Path(__file__).parent / "coc.db"
-KEEP_DAYS = 21        # battles older than this are deleted
+KEEP_DAYS = 8         # battles older than this are deleted (the ranked window is 7 days)
+LEGEND_KEEP_DAYS = 2  # Legend I resets daily, so its battles are only needed for ~2 days
 MAX_TRACKED = 100     # max registered players
-MAX_PER_USER = 15   # players one Discord user can register
-MAX_WATCHED = 10000   # max players polled only because they share a league group (100 per group)
+MAX_PER_USER = 10     # players one Discord user can register
+MAX_WATCHED = 15000   # max players polled only because they share a league group or are Legend I
 _FMT = "%Y-%m-%dT%H:%M:%S"
 
 
@@ -57,6 +58,8 @@ def init():
             CREATE TABLE IF NOT EXISTS legend_trophies (
                 tag TEXT PRIMARY KEY, trophies INTEGER NOT NULL, updated TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS legend_trophies_t ON legend_trophies (trophies);
+            CREATE TABLE IF NOT EXISTS larp_uses (
+                user_id INTEGER PRIMARY KEY, day TEXT NOT NULL, count INTEGER NOT NULL);
         """)
 
 
@@ -202,6 +205,57 @@ def legend_rank(trophies, tag=None):
     return ahead + 1, total
 
 
+def legend_count():
+    """How many Legend I players have a stored trophy count."""
+    with _db() as c:
+        return c.execute("SELECT COUNT(*) FROM legend_trophies").fetchone()[0]
+
+
+def legend_top(offset, limit):
+    """One page of the Legend I leaderboard, best first: [{tag, name, trophies}].
+    Only `limit` rows are read, so a huge leaderboard never gets loaded at once."""
+    with _db() as c:
+        rows = c.execute(
+            "SELECT lt.tag, lt.trophies, COALESCE(w.name, t.name) AS name "
+            "FROM legend_trophies lt "
+            "LEFT JOIN watched w ON w.tag = lt.tag "
+            "LEFT JOIN tracked t ON t.tag = lt.tag "
+            "ORDER BY lt.trophies DESC, lt.tag LIMIT ? OFFSET ?", (limit, max(0, offset))).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ---- /larp daily limit ----
+def claim_larp(user_id, day, limit):
+    """Use up one /larp for `user_id` on `day` (any string that changes each day).
+    False if they already used `limit` today. limit <= 0 means unlimited."""
+    if limit <= 0:
+        return True
+    c = sqlite3.connect(DB_PATH, timeout=10, isolation_level=None)
+    try:
+        c.execute("BEGIN IMMEDIATE")   # no two simultaneous /larp can both slip through
+        row = c.execute("SELECT day, count FROM larp_uses WHERE user_id=?", (user_id,)).fetchone()
+        used = row[1] if row and row[0] == day else 0
+        if used >= limit:
+            c.execute("ROLLBACK")
+            return False
+        c.execute("INSERT OR REPLACE INTO larp_uses (user_id, day, count) VALUES (?,?,?)",
+                  (user_id, day, used + 1))
+        c.execute("COMMIT")
+        return True
+    except Exception:
+        c.execute("ROLLBACK")
+        raise
+    finally:
+        c.close()
+
+
+def refund_larp(user_id, day):
+    """Give back a /larp that failed before an image was sent."""
+    with _db() as c:
+        c.execute("UPDATE larp_uses SET count = count - 1 WHERE user_id=? AND day=? AND count > 0",
+                  (user_id, day))
+
+
 # ---- battles ----
 def save_battles_many(by_tag):
     """by_tag = {tag: [battle dicts from coc_api.extract_ranked]}. One transaction.
@@ -254,6 +308,19 @@ def prune():
     with _db() as c:
         c.execute("DELETE FROM watched WHERE expires < ?", (_now(),))
         c.execute("DELETE FROM battles WHERE time < ?", (cutoff,))
+        legend_cutoff = (datetime.now(timezone.utc) - timedelta(days=LEGEND_KEEP_DAYS)).strftime(_FMT)
+        c.execute("DELETE FROM battles WHERE time < ? AND tag IN "
+                  "(SELECT tag FROM watched WHERE group_key=?)", (legend_cutoff, LEGEND_GROUP))
         c.execute("DELETE FROM battles WHERE tag NOT IN "
                   "(SELECT tag FROM tracked UNION SELECT tag FROM watched)")
         c.execute("DELETE FROM legend_trophies WHERE tag NOT IN (SELECT tag FROM watched)")
+
+def vacuum():
+    """Give deleted space back to the disk (SQLite keeps the file size otherwise).
+    Needs free disk space about equal to the database size while it runs."""
+    c = sqlite3.connect(DB_PATH, timeout=60, isolation_level=None)
+    try:
+        c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        c.execute("VACUUM")
+    finally:
+        c.close()

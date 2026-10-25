@@ -269,8 +269,13 @@ def league_slug(text):
 
 
 def league_family(league):
-    """'Dragon 28' -> 'Dragon', 'Legend III' -> 'Legend'."""
-    return re.sub(r"\s+(\d+|[IVXivx]+)$", "", (league or "").strip())
+    """'Dragon 28' -> 'Dragon', 'Legend III' -> 'Legend', 'P.E.K.K.A League' -> 'P.E.K.K.A'."""
+    s = (league or "").strip()
+    while True:   # handles 'Titan League', 'Titan 26' and 'Titan League 26'
+        t = re.sub(r"\s+(league|\d+|[IVXivx]+)$", "", s, flags=re.I)
+        if t == s:
+            return s
+        s = t
 
 
 def _index_league_files():
@@ -371,6 +376,25 @@ def random_battles(kind, count=None, limit=MAX_BATTLES):
     return out
 
 
+LEGEND1_RANK_POOL = 14000   # rough number of Legend I players: random ranks there run 1..this
+
+
+def realistic_rank(attacks, defenses, league):
+    """A rank that matches how the battles went: good attacks and few stars given up -> near
+    the top, bad ones -> near the bottom. Same idea as a percentile, with some luck mixed in."""
+    pool = LEGEND1_RANK_POOL if coc_api.is_legend1(league) else PLAYERS_PER_LEAGUE
+    if not attacks and not defenses:
+        return random.randint(1, pool)
+    n = max(len(attacks), len(defenses), 1)
+    off = sum(s for s, _ in attacks) / len(attacks) if attacks else 2.35
+    dfn = sum(s for s, _ in defenses) / len(defenses) if defenses else 1.85
+    score = 0.6 * off / 3 + 0.4 * (1 - dfn / 3)           # 0..1, higher is better
+    mean, sd = 0.6233, 0.2187 / math.sqrt(n)               # what random_battles() produces on average
+    z = (score - mean) / sd + random.gauss(0, 0.6)          # a bit of luck so it isn't exact
+    pct = 0.5 * (1 + math.erf(z / math.sqrt(2)))            # 0..1, higher is better
+    return max(1, min(pool, round(1 + (1 - pct) * (pool - 1))))
+
+
 def derive_stats(attacks, defenses, legend1=False):
     """Everything is calculated from the battle lists: trophy totals, average stars,
     average destruction %. Empty list -> zeros."""
@@ -387,6 +411,9 @@ def derive_stats(attacks, defenses, legend1=False):
     return vals
 
 
+LEGEND1_BASE_TROPHIES = 5000   # /larp only: a Legend I total starts from this many trophies
+
+
 def resolve(name, rank, attacks_txt, defenses_txt, randomize=False, league=None):
     """Returns (render kwargs, error)."""
     league = (league or DEFAULT_LEAGUE)[:LEAGUE_MAX_CHARS]
@@ -395,7 +422,6 @@ def resolve(name, rank, attacks_txt, defenses_txt, randomize=False, league=None)
     max_rank = 999999 if coc_api.is_legend1(league) else PLAYERS_PER_LEAGUE   # Legend I has no 100-player group
     if n is not None and not 1 <= n <= max_rank:
         return None, f"Rank must be between 1 and {max_rank}."
-    movement = movement_from_rank(league, rank)
 
     attacks, e1 = parse_battles(attacks_txt or "", limit)
     if e1:
@@ -406,6 +432,9 @@ def resolve(name, rank, attacks_txt, defenses_txt, randomize=False, league=None)
     if randomize:
         attacks = random_battles("off", None, limit)
         defenses = random_battles("def", None, limit)
+    if rank is None or not str(rank).strip():
+        rank = str(realistic_rank(attacks, defenses, league))
+    movement = movement_from_rank(league, rank)
     vals = derive_stats(attacks, defenses, coc_api.is_legend1(league))
     vals.update(name=str(name)[:NAME_MAX_CHARS], rank=str(rank)[:10],
                 attacks=attacks, defenses=defenses,
@@ -713,6 +742,7 @@ def render(name: str, rank: str, off_total: int, def_total: int,
 # ---- discord.py part ----
 log = logging.getLogger("cocbot")
 POLL_INTERVAL = 900   # seconds between battlelog polls (15 minutes)
+VACUUM_EVERY = 96     # poll cycles between database vacuums (96 x 15 min = 1 day)
 
 
 # ONE-TIME cleanup: put your server IDs here, run the bot once, then delete this list and the loop below
@@ -725,7 +755,8 @@ CLEAN_GUILDS = [
 class CocClient(discord.Client):
     async def setup_hook(self):
         await asyncio.to_thread(coc_db.init)
-        await tree.sync()
+        synced = await tree.sync()
+        log.info("synced %d commands: %s", len(synced), ", ".join(sorted(c.name for c in synced)))
 
         for gid in CLEAN_GUILDS:
             obj = discord.Object(id=gid)
@@ -844,6 +875,7 @@ async def discover_legend1(cands):
             _not_legend1[tag] = loop.time() + LEGEND1_REJECT_HOURS * 3600
 
     await asyncio.gather(*(check(t) for t in cands))
+    log.info("legend1 discovery: checked %d candidates, %d are Legend I", len(cands), len(found))
     if not found:
         return
     expires = datetime.now(timezone.utc) + timedelta(days=LEGEND1_EXPIRES_DAYS)
@@ -917,6 +949,7 @@ async def poll_once(refresh=False):
     gate = asyncio.Semaphore(POLL_CONCURRENCY)
     new_total = 0
     opp_tags = set()   # opponents seen in Legend I battles this cycle
+    legend_battles = 0  # diagnostics: how many battles were of type "legend"
 
     async def one(tag):
         nonlocal new_total
@@ -927,6 +960,8 @@ async def poll_once(refresh=False):
                 log.warning("poll #%s: %s", tag, e)
                 return
         battles = coc_api.extract_ranked(items)
+        nonlocal legend_battles
+        legend_battles += sum(1 for b in battles if b.get("legend"))
         opp_tags.update(b["opp"] for b in battles if b.get("legend") and b.get("opp"))
         try:
             n = await asyncio.to_thread(coc_db.save_battles, tag, battles)
@@ -949,7 +984,10 @@ async def poll_once(refresh=False):
             await one(tag)
 
     await asyncio.gather(*(worker() for _ in range(POLL_CONCURRENCY)))
-    await discover_legend1(sorted(opp_tags - set(tags)))
+    cands = sorted(opp_tags - set(tags))
+    log.info("legend1 discovery: %d legend-type battles seen, %d opponents, %d not watched yet",
+             legend_battles, len(opp_tags), len(cands))
+    await discover_legend1(cands)
     if refresh:
         await asyncio.to_thread(coc_db.prune)
     log.info("polled %d players, %d new ranked battles in %.0fs",
@@ -969,14 +1007,27 @@ async def poll_loop():
         except Exception:
             log.exception("poll failed")
         cycle += 1
+        if cycle % VACUUM_EVERY == 0:   # about once a day: return deleted space to the disk
+            try:
+                await asyncio.to_thread(coc_db.vacuum)
+                log.info("database vacuumed")
+            except Exception:
+                log.exception("vacuum failed")
         await asyncio.sleep(max(30, POLL_INTERVAL - (loop.time() - started)))
 
 
-async def send_image(inter, vals, view=None):
+LARP_DAILY_LIMIT = 1        # /larp uses per person per day. 0 = unlimited
+LARP_EXEMPT_USERS = set()   # Discord user IDs with no limit, e.g. {123456789012345678}
+LARP_DISCLAIMER = "-# 🎭 Just for fun, these battles are randomly generated. Only `/battle_log` shows real tracked battles."
+
+
+async def send_image(inter, vals, view=None, content=None):
     """Renders the image and sends it. Returns the sent message (needed for the view timeout)."""
     async with sem:
         data = await asyncio.get_running_loop().run_in_executor(None, lambda: render(**vals))
     kwargs = {"view": view} if view else {}
+    if content:
+        kwargs["content"] = content
     return await inter.followup.send(file=discord.File(io.BytesIO(data), "out.png"), **kwargs)
 
 
@@ -1326,30 +1377,37 @@ async def tracked_autocomplete(inter: discord.Interaction, current: str):
 
 
 # ---- /larp : manual input ----
-@tree.command(name="larp", description="Generate the trophy summary image from typed battles")
+@tree.command(name="larp", description="Generate a trophy summary image with random battles and a random rank")
 @app_commands.describe(
     name="Player name (max 15 characters)",
-    rank="Player rank 1-100 in the league (decides promotion/demotion banner)",
-    attacks="Attacks as stars:destruction%, e.g. 3:100 2:75 1:60 0:30",
-    defenses="Defenses as stars:destruction%, e.g. 3:100 2:80 0:30",
-    randomize="Randomly generate attacks and defenses (overrides typed ones)",
     league="League name, e.g. Legend III. Automatically sets the number of attacks/defenses",
 )
 async def coc(
     inter: discord.Interaction,
     name: NameT,
-    rank: str,
-    attacks: Optional[BattlesT] = None,
-    defenses: Optional[BattlesT] = None,
-    randomize: bool = False,
     league: Optional[app_commands.Range[str, 1, LEAGUE_MAX_CHARS]] = None,
 ):
-    vals, err = resolve(name, rank, attacks, defenses, randomize, league)
+    vals, err = resolve(name, None, None, None, True, league)   # rank=None -> realistic random rank
     if err:
         await inter.response.send_message(err, ephemeral=True)
         return
+    if coc_api.is_legend1(vals["league"]):   # Legend I: total = 5000 + attacks + defenses
+        vals["total_override"] = LEGEND1_BASE_TROPHIES + vals["off_total"] + vals["def_total"]
+    # the "day" resets with the game (05:00 GMT), same as the Legend I window
+    window_start, window_end = coc_api.legend1_window()
+    day = window_start.strftime("%Y-%m-%d")
+    limit = 0 if inter.user.id in LARP_EXEMPT_USERS else LARP_DAILY_LIMIT
+    if not await asyncio.to_thread(coc_db.claim_larp, inter.user.id, day, limit):
+        await inter.response.send_message(
+            f"You've already used `/larp` today. You can use it again <t:{int(window_end.timestamp())}:R>.",
+            ephemeral=True)
+        return
     await inter.response.defer()
-    await send_image(inter, vals)
+    try:
+        await send_image(inter, vals, content=LARP_DISCLAIMER)
+    except Exception:
+        await asyncio.to_thread(coc_db.refund_larp, inter.user.id, day)   # don't burn their use on an error
+        raise
 
 
 @coc.autocomplete("league")
@@ -1516,14 +1574,25 @@ async def untrack_player(inter: discord.Interaction, player: PlayerT):
 untrack_player.autocomplete("player")(tracked_autocomplete)
 
 
+def _split_watched(watched):
+    """(Legend I players, league group members) from coc_db.list_watched()."""
+    legend = [w for w in watched if w["group_key"] == coc_db.LEGEND_GROUP]
+    league = [w for w in watched if w["group_key"] != coc_db.LEGEND_GROUP]
+    return legend, league
+
+
 def _tracked_text(rows, watched, fmt, bold):
     lines = [f"{bold}Registered players ({len(rows)}){bold}"]
     lines += [f"- {fmt(r['name'])} (#{r['tag']})" for r in rows]
-    if watched:
+    legend, league = _split_watched(watched)
+    if legend:
+        lines += ["", f"{bold}Also tracked: Legend I players ({len(legend)}){bold}"]
+        lines += [f"- {fmt(w['name'])} (#{w['tag']})" for w in legend]
+    if league:
         groups = {}
-        for w in watched:
+        for w in league:
             groups.setdefault(w["group_key"], []).append(w)
-        lines += ["", f"{bold}Also tracked: league group members ({len(watched)}){bold}"]
+        lines += ["", f"{bold}Also tracked: league group members ({len(league)}){bold}"]
         for i, members in enumerate(groups.values(), 1):
             lines.append(f"League group {i} ({len(members)} players)")
             lines += [f"- {fmt(w['name'])} (#{w['tag']})" for w in members]
@@ -1537,6 +1606,9 @@ async def tracked_players(inter: discord.Interaction):
     if not rows and not watched:
         await inter.response.send_message("Nobody is tracked yet. Use `/track_player`.", ephemeral=True)
         return
+    legend, league = _split_watched(watched)
+    summary = (f"{len(rows)} registered + {len(legend)} Legend I + {len(league)} league group "
+               f"members are tracked.")
     text = _tracked_text(rows, watched, safe_name, "**")
     if len(text) <= 1900:
         await inter.response.send_message(text)
@@ -1544,8 +1616,124 @@ async def tracked_players(inter: discord.Interaction):
     # too long for one Discord message -> send the full list as a text file
     plain = _tracked_text(rows, watched, lambda n: n or "Unknown", "")
     await inter.response.send_message(
-        f"{len(rows)} registered + {len(watched)} league group members are tracked. Full list attached.",
+        f"{summary} Full list attached.",
         file=discord.File(io.BytesIO(plain.encode("utf-8")), filename="tracked_players.txt"))
+
+
+# ---- /leaderboard : Legend I trophy leaderboard, read from the database one page at a time ----
+TOP_PAGE_SIZE = 10
+RankT = app_commands.Range[int, 1, 1000000]
+
+
+def top_pages(start, end):
+    """Number of pages needed for ranks start..end (inclusive)."""
+    return max(1, math.ceil((end - start + 1) / TOP_PAGE_SIZE))
+
+
+def top_page_text(rows, first_rank):
+    """Monospace block for one page. rows come from coc_db.legend_top()."""
+    last = first_rank + len(rows) - 1
+    rw = max(4, len(str(last)) + 1)
+    lines = []
+    for i, r in enumerate(rows):
+        name = (r.get("name") or "Unknown").replace("`", "'").replace("\n", " ")
+        if len(name) > 22:
+            name = name[:21] + "…"
+        lines.append(f"{('#' + str(first_rank + i)):<{rw}} {r['trophies']:>5}  {name}")
+    return "```\n" + "\n".join(lines) + "\n```"
+
+
+class TopView(discord.ui.View):
+    def __init__(self, owner_id, start, end, total):
+        super().__init__(timeout=300)
+        self.owner_id, self.start, self.end, self.total = owner_id, start, end, total
+        self.pages = top_pages(start, end)
+        self.page = 0
+        self.message = None
+        self._sync_buttons()
+
+    def _bounds(self):
+        first = self.start + self.page * TOP_PAGE_SIZE
+        return first, min(self.end, first + TOP_PAGE_SIZE - 1)
+
+    def _sync_buttons(self):
+        self.first_btn.disabled = self.prev_btn.disabled = self.page == 0
+        self.next_btn.disabled = self.last_btn.disabled = self.page >= self.pages - 1
+        self.page_btn.label = f"{self.page + 1}/{self.pages}"
+
+    async def make_embed(self):
+        first, last = self._bounds()
+        rows = await asyncio.to_thread(coc_db.legend_top, first - 1, last - first + 1)
+        emb = discord.Embed(title="Legend I leaderboard",
+                            description=top_page_text(rows, first) if rows else "No players in this range.",
+                            colour=discord.Colour.gold())
+        emb.set_footer(text=f"Ranks {first}-{last} of {self.total} tracked players. Approximate: only players "
+                            f"the bot has found are counted, trophies refresh hourly.")
+        return emb
+
+    async def _go(self, inter, page):
+        self.page = max(0, min(self.pages - 1, page))
+        self._sync_buttons()
+        await inter.response.edit_message(embed=await self.make_embed(), view=self)
+
+    async def interaction_check(self, inter):
+        if inter.user.id != self.owner_id:
+            await inter.response.send_message("Run `/leaderboard` yourself to page through it.", ephemeral=True)
+            return False
+        return True
+
+    async def on_timeout(self):
+        for b in self.children:
+            b.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+    @discord.ui.button(label="⏮", style=discord.ButtonStyle.secondary)
+    async def first_btn(self, inter: discord.Interaction, button: discord.ui.Button):
+        await self._go(inter, 0)
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary)
+    async def prev_btn(self, inter: discord.Interaction, button: discord.ui.Button):
+        await self._go(inter, self.page - 1)
+
+    @discord.ui.button(label="1/1", style=discord.ButtonStyle.secondary, disabled=True)
+    async def page_btn(self, inter: discord.Interaction, button: discord.ui.Button):
+        pass
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary)
+    async def next_btn(self, inter: discord.Interaction, button: discord.ui.Button):
+        await self._go(inter, self.page + 1)
+
+    @discord.ui.button(label="⏭", style=discord.ButtonStyle.secondary)
+    async def last_btn(self, inter: discord.Interaction, button: discord.ui.Button):
+        await self._go(inter, self.pages - 1)
+
+
+@tree.command(name="leaderboard", description="Legend I trophy leaderboard (top 10 by default, or any rank range)")
+@app_commands.describe(start="First rank to show (default 1)",
+                       end="Last rank to show (default: 10 players from start). Example: start 5678, end 6000")
+@app_commands.checks.cooldown(1, 5.0)
+async def top(inter: discord.Interaction, start: RankT = 1, end: Optional[RankT] = None):
+    total = await asyncio.to_thread(coc_db.legend_count)
+    if not total:
+        await inter.response.send_message("No Legend I trophies stored yet. Give the bot a few minutes.",
+                                          ephemeral=True)
+        return
+    if end is None:
+        end = start + TOP_PAGE_SIZE - 1
+    if end < start:
+        start, end = end, start
+    if start > total:
+        await inter.response.send_message(f"Only **{total}** Legend I players are tracked, "
+                                          f"so rank {start} doesn't exist yet.", ephemeral=True)
+        return
+    end = min(end, total)
+    view = TopView(inter.user.id, start, end, total)
+    await inter.response.send_message(embed=await view.make_embed(), view=view)
+    view.message = await inter.original_response()
 
 
 @tree.error
@@ -1602,4 +1790,4 @@ if __name__ == "__main__":
         print(f"Offense {vals['off_total']:+d}, Defense {vals['def_total']:+d}, "
               f"Total = {vals['off_total'] + vals['def_total']}. Saved test.png")
     else:
-        client.run(TOKEN)
+        client.run(TOKEN, root_logger=True)   # root_logger: show this bot's own log.info lines too
